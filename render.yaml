@@ -13,7 +13,7 @@ services:
       - key: INFURA_KEY
         value: f756f81d463942dbb3fec9ce3ff2a843
 
-  # Frontend (Next.js)
+  # Frontend (Next.js) - Updated configuration
   - type: web
     name: arbitrage-bot-frontend
     env: node
