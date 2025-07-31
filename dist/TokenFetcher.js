@@ -25,6 +25,10 @@ export class TokenFetcher {
             // Additional DEXs can be added here for more arbitrage opportunities
         };
         this.demoMode = false;
+        this.requestQueue = [];
+        this.lastRequestTime = 0;
+        this.REQUEST_DELAY = 100; // 100ms between requests
+        this.MAX_CONCURRENT_REQUESTS = 3;
         try {
             if (!process.env.INFURA_KEY) {
                 console.warn('⚠️ No INFURA_KEY found - running in demo mode');
@@ -42,6 +46,30 @@ export class TokenFetcher {
             this.demoMode = true;
         }
     }
+    // Rate limiting wrapper for blockchain calls
+    async rateLimit(operation) {
+        // Wait if we need to delay between requests
+        const now = Date.now();
+        const timeSinceLastRequest = now - this.lastRequestTime;
+        if (timeSinceLastRequest < this.REQUEST_DELAY) {
+            await new Promise(resolve => setTimeout(resolve, this.REQUEST_DELAY - timeSinceLastRequest));
+        }
+        // Limit concurrent requests
+        if (this.requestQueue.length >= this.MAX_CONCURRENT_REQUESTS) {
+            await Promise.race(this.requestQueue);
+        }
+        this.lastRequestTime = Date.now();
+        const promise = operation();
+        this.requestQueue.push(promise);
+        // Clean up completed requests
+        promise.finally(() => {
+            const index = this.requestQueue.indexOf(promise);
+            if (index > -1) {
+                this.requestQueue.splice(index, 1);
+            }
+        });
+        return promise;
+    }
     async getUniswapV2Price(baseToken, quoteToken) {
         try {
             // Demo mode fallback
@@ -57,47 +85,49 @@ export class TokenFetcher {
                 };
             }
             console.log(`🔍 Fetching Uniswap V2 price for ${baseToken.symbol}/${quoteToken.symbol}`);
-            const factory = new ethers.Contract(this.DEX_ADDRESSES.UNISWAP_V2_FACTORY, FACTORY_ABI, this.provider);
-            const pairAddress = await factory.getPair(baseToken.address, quoteToken.address);
-            console.log(`📍 Pair address: ${pairAddress}`);
-            if (pairAddress === ethers.ZeroAddress) {
-                console.log(`❌ No pair found for ${baseToken.symbol}/${quoteToken.symbol}`);
-                return null;
-            }
-            const pair = new ethers.Contract(pairAddress, PAIR_ABI, this.provider);
-            const [token0, token1] = await Promise.all([
-                pair.token0(),
-                pair.token1()
-            ]);
-            console.log(`🔗 Token0: ${token0}, Token1: ${token1}`);
-            console.log(`🏷️ Base token (${baseToken.symbol}): ${baseToken.address}`);
-            console.log(`🏷️ Quote token (${quoteToken.symbol}): ${quoteToken.address}`);
-            const { reserve0, reserve1 } = await pair.getReserves();
-            console.log(`💰 Reserve0: ${reserve0.toString()}, Reserve1: ${reserve1.toString()}`);
-            if (!reserve0 || !reserve1) {
-                console.log(`❌ No reserves found`);
-                return null;
-            }
-            const baseIsToken0 = baseToken.address.toLowerCase() === token0.toLowerCase();
-            console.log(`🔄 Base is token0: ${baseIsToken0}`);
-            let price;
-            if (baseIsToken0) {
-                // Base is token0, quote is token1: price = reserve1/reserve0
-                price = (Number(reserve1) / 10 ** quoteToken.decimals) / (Number(reserve0) / 10 ** baseToken.decimals);
-            }
-            else {
-                // Base is token1, quote is token0: price = reserve0/reserve1  
-                price = (Number(reserve0) / 10 ** quoteToken.decimals) / (Number(reserve1) / 10 ** baseToken.decimals);
-            }
-            console.log(`💲 Calculated price: ${price}`);
-            return {
-                price,
-                source: 'Uniswap V2',
-                baseToken: baseToken.symbol,
-                quoteToken: quoteToken.symbol,
-                timestamp: Date.now(),
-                fee: 0.003 // 0.3% trading fee
-            };
+            return await this.rateLimit(async () => {
+                const factory = new ethers.Contract(this.DEX_ADDRESSES.UNISWAP_V2_FACTORY, FACTORY_ABI, this.provider);
+                const pairAddress = await factory.getPair(baseToken.address, quoteToken.address);
+                console.log(`📍 Pair address: ${pairAddress}`);
+                if (pairAddress === ethers.ZeroAddress) {
+                    console.log(`❌ No pair found for ${baseToken.symbol}/${quoteToken.symbol}`);
+                    return null;
+                }
+                const pair = new ethers.Contract(pairAddress, PAIR_ABI, this.provider);
+                const [token0, token1] = await Promise.all([
+                    pair.token0(),
+                    pair.token1()
+                ]);
+                console.log(`🔗 Token0: ${token0}, Token1: ${token1}`);
+                console.log(`🏷️ Base token (${baseToken.symbol}): ${baseToken.address}`);
+                console.log(`🏷️ Quote token (${quoteToken.symbol}): ${quoteToken.address}`);
+                const { reserve0, reserve1 } = await pair.getReserves();
+                console.log(`💰 Reserve0: ${reserve0.toString()}, Reserve1: ${reserve1.toString()}`);
+                if (!reserve0 || !reserve1) {
+                    console.log(`❌ No reserves found`);
+                    return null;
+                }
+                const baseIsToken0 = baseToken.address.toLowerCase() === token0.toLowerCase();
+                console.log(`🔄 Base is token0: ${baseIsToken0}`);
+                let price;
+                if (baseIsToken0) {
+                    // Base is token0, quote is token1: price = reserve1/reserve0
+                    price = (Number(reserve1) / 10 ** quoteToken.decimals) / (Number(reserve0) / 10 ** baseToken.decimals);
+                }
+                else {
+                    // Base is token1, quote is token0: price = reserve0/reserve1  
+                    price = (Number(reserve0) / 10 ** quoteToken.decimals) / (Number(reserve1) / 10 ** baseToken.decimals);
+                }
+                console.log(`💲 Calculated price: ${price}`);
+                return {
+                    price,
+                    source: 'Uniswap V2',
+                    baseToken: baseToken.symbol,
+                    quoteToken: quoteToken.symbol,
+                    timestamp: Date.now(),
+                    fee: 0.003 // 0.3% trading fee
+                };
+            });
         }
         catch (error) {
             console.error(`❌ Error getting Uniswap V2 price for ${baseToken.symbol}/${quoteToken.symbol}:`, error);

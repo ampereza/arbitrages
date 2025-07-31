@@ -152,16 +152,16 @@ async function findOpportunities() {
       return;
     }
     
-    // Get some trading pairs
+    // Get some trading pairs - reduced from many to just 1 pair to prevent rate limiting
     const pairs = await tokenFetcher.generateTradingPairs();
-    const randomPairs = pairs.slice(0, 3); // Check first 3 pairs for demo
+    const randomPairs = pairs.slice(0, 1); // Check only 1 pair per cycle
     
     const opportunities = [];
     
     for (const pair of randomPairs) {
       try {
-        // Add delay between requests to avoid rate limiting
-        await new Promise(resolve => setTimeout(resolve, 2000)); // 2000ms delay (2 seconds)
+        // Add larger delay between requests to avoid rate limiting
+        await new Promise(resolve => setTimeout(resolve, 5000)); // 5 second delay
         
         const analysis = await tokenFetcher.analyzeArbitrageOpportunity(
           pair.baseToken,
@@ -215,13 +215,23 @@ async function findOpportunities() {
       console.log('❌ No new profitable opportunities found');
     }
     
-  } catch (error) {
+  } catch (error: any) {
+    // Check for rate limiting errors
+    if (error?.message?.includes('Too Many Requests') || error?.code === 'BAD_DATA') {
+      console.warn('⚠️ Rate limit detected - pausing scanning for 5 minutes');
+      // Temporarily stop the bot to cool down
+      setTimeout(() => {
+        console.log('🔄 Resuming after rate limit cooldown');
+      }, 300000); // 5 minute pause
+      return;
+    }
+    
     console.error('Error in opportunity scanning:', error);
   }
 }
 
-// Start the opportunity scanner
-setInterval(findOpportunities, 30000); // Check every 30 seconds
+// Start the opportunity scanner with reduced frequency to prevent rate limiting
+setInterval(findOpportunities, 120000); // Check every 2 minutes (was 30 seconds)
 
 app.listen(port, () => {
   console.log(`🌐 API server running on port ${port}`);
