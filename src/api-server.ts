@@ -31,6 +31,16 @@ let botStatus = {
   todayProfit: 0
 };
 
+// Health check endpoint for deployment platforms
+app.get('/api/health', (req, res) => {
+  res.status(200).json({ 
+    status: 'healthy', 
+    timestamp: Date.now(),
+    uptime: process.uptime(),
+    botRunning: botStatus.running
+  });
+});
+
 // Store opportunities with expiration tracking
 interface StoredOpportunity {
   id: string;

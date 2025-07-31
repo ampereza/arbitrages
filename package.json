@@ -10,7 +10,9 @@
         "dev": "ts-node --esm src/index.ts",
         "api": "npm run build && node dist/api-server.js",
         "frontend": "cd src/frontend && npm run dev",
-        "full": "concurrently \"npm run api\" \"npm run frontend\""
+        "full": "concurrently \"npm run api\" \"npm run frontend\"",
+        "postinstall": "npm run build",
+        "heroku-postbuild": "npm run build"
     },
     "dependencies": {
         "@balancer-labs/sdk": "^0.0.15",

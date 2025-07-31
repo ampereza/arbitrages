@@ -26,6 +26,15 @@ let botStatus = {
     successRate: 85,
     todayProfit: 0
 };
+// Health check endpoint for deployment platforms
+app.get('/api/health', (req, res) => {
+    res.status(200).json({
+        status: 'healthy',
+        timestamp: Date.now(),
+        uptime: process.uptime(),
+        botRunning: botStatus.running
+    });
+});
 let persistentOpportunities = new Map();
 const OPPORTUNITY_LIFETIME = 5 * 60 * 1000; // 5 minutes
 const OPPORTUNITY_REFRESH_INTERVAL = 30 * 1000; // 30 seconds

@@ -1,0 +1,30 @@
+services:
+  # Backend API Server
+  - type: web
+    name: arbitrage-bot-api
+    env: node
+    plan: starter
+    buildCommand: npm install && npm run build
+    startCommand: npm run api
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 3001
+      - key: INFURA_KEY
+        fromSecret: INFURA_KEY
+    healthCheckPath: /api/health
+
+  # Frontend (Next.js)
+  - type: web
+    name: arbitrage-bot-frontend
+    env: node
+    plan: starter
+    buildCommand: cd src/frontend && npm install && npm run build
+    startCommand: cd src/frontend && npm start
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: NEXT_PUBLIC_API_URL
+        value: https://arbitrage-bot-api.onrender.com
+    rootDir: src/frontend
