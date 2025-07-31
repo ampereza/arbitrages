@@ -1,0 +1,32 @@
+{
+    "name": "arbitrage-bot",
+    "version": "1.0.0",
+    "type": "module",
+    "description": "Ethereum DEX arbitrage bot for monitoring token price differences",
+    "main": "dist/index.js",
+    "scripts": {
+        "build": "tsc",
+        "start": "npm run build && node dist/index.js",
+        "dev": "ts-node --esm src/index.ts",
+        "api": "npm run build && node dist/api-server.js",
+        "frontend": "cd src/frontend && npm run dev",
+        "full": "concurrently \"npm run api\" \"npm run frontend\""
+    },
+    "dependencies": {
+        "@balancer-labs/sdk": "^0.0.15",
+        "@curvefi/api": "^2.68.2",
+        "@types/cors": "^2.8.19",
+        "@types/express": "^5.0.3",
+        "axios": "^1.11.0",
+        "concurrently": "^9.2.0",
+        "cors": "^2.8.5",
+        "dotenv": "^16.6.1",
+        "ethers": "^6.15.0",
+        "express": "^5.1.0"
+    },
+    "devDependencies": {
+        "@types/node": "^20.11.19",
+        "ts-node": "^10.9.2",
+        "typescript": "^5.3.3"
+    }
+}
