@@ -12,7 +12,7 @@ services:
       - key: PORT
         value: 3001
       - key: INFURA_KEY
-        fromSecret: INFURA_KEY
+        value: f756f81d463942dbb3fec9ce3ff2a843
     healthCheckPath: /api/health
 
   # Frontend (Next.js)
