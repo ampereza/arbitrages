@@ -1,21 +1,21 @@
 {
     "name": "arbitrage-bot",
     "version": "1.0.0",
-    "type": "module",
     "description": "Ethereum DEX arbitrage bot for monitoring token price differences",
     "main": "dist/index.js",
     "scripts": {
         "build": "tsc",
         "start": "npm run build && node dist/index.js",
-        "dev": "ts-node --esm src/index.ts",
+        "dev": "node scripts/run.js",
         "api": "npm run build && node dist/api-server.js",
-        "frontend": "cd src/frontend && npm run dev",
+        "frontend": "cd src/frontend && npm install && npm run dev",
+        "setup-frontend": "mkdir -p src/frontend/src/pages && cd src/frontend && npm init -y && npm install next react react-dom",
         "full": "concurrently \"npm run api\" \"npm run frontend\"",
         "postinstall": "npm run build",
         "heroku-postbuild": "npm run build"
     },
     "dependencies": {
-        "@balancer-labs/sdk": "^0.0.15",
+        "@balancer-labs/sdk": "^0.0.10",
         "@curvefi/api": "^2.68.2",
         "@types/cors": "^2.8.19",
         "@types/express": "^5.0.3",
@@ -24,11 +24,18 @@
         "cors": "^2.8.5",
         "dotenv": "^16.6.1",
         "ethers": "^6.15.0",
-        "express": "^5.1.0"
+        "express": "^5.1.0",
+        "graphql": "^16.11.0",
+        "graphql-request": "^7.2.0",
+        "next": "^15.4.5",
+        "web3": "^1.10.0",
+        "web3-core": "^1.10.0",
+        "web3-eth-contract": "^1.10.0",
+        "web3-utils": "^1.10.0"
     },
     "devDependencies": {
-        "@types/node": "^20.11.19",
+        "@types/node": "^20.19.9",
         "ts-node": "^10.9.2",
-        "typescript": "^5.3.3"
+        "typescript": "^5.9.2"
     }
 }

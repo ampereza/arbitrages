@@ -1,850 +1,231 @@
-import { ethers } from 'ethers';
+import { NetworkType } from './interfaces/Web3Types';
+import { Token } from './interfaces/GraphTypes';
+import { PriceInfo } from './interfaces/PriceInfo';
 import axios from 'axios';
 
-interface PriceInfo {
-    price: number;
-    source: string;
-    baseToken: string;
-    quoteToken: string;
-    timestamp: number;
-    fee: number; // Trading fee as decimal (0.003 = 0.3%)
+export class TokenFetcher {
+    private web3: NetworkType;
+    private graphQLEndpoint = 'https://api.thegraph.com/subgraphs/name/uniswap/arbitrum';
+
+    constructor(web3: NetworkType) {
+        this.web3 = web3;
+    }
+
+    public async fetchTokens(options: { minLiquidity?: number } = {}): Promise<Token[]> {
+        const { minLiquidity = 0 } = options;
+
+        try {
+            const testTokens: Token[] = [
+                {
+                    address: '0x82af49447d8a07e3bd95bd0d56f35241523fbab1',
+                    symbol: 'WETH',
+                    name: 'Wrapped Ether',
+                    decimals: 18
+                },
+                {
+                    address: '0xff970a61a04b1ca14834a43f5de4533ebddb5cc8',
+                    symbol: 'USDC',
+                    name: 'USD Coin',
+                    decimals: 6
+                }
+            ];
+
+            return testTokens;
+        } catch (error) {
+            console.error('Error fetching tokens:', error);
+            return [];
+        }
+    }
 }
 
-// ABIs for DEX contracts
-const PAIR_ABI = [
-    'function getReserves() view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast)',
-    'function token0() view returns (address)',
-    'function token1() view returns (address)'
-];
+interface TradeSizing {
+    minAmount: number;
+    maxAmount: number;
+    recommendedAmount: number;
+    profitable: boolean;
+    reason: string;
+}
 
-const FACTORY_ABI = [
-    'function getPair(address tokenA, address tokenB) view returns (address pair)'
-];
-
-const UNIV3_FACTORY_ABI = [
-    'function getPool(address tokenA, address tokenB, uint24 fee) view returns (address pool)'
-];
-
-const UNIV3_POOL_ABI = [
-    'function slot0() view returns (uint160 sqrtPriceX96, int24 tick, uint16 observationIndex, uint16 observationCardinality, uint16 observationCardinalityNext, uint8 feeProtocol, bool unlocked)'
-];
-
-// AAVE ABIs removed - using only DEX protocols for price comparison
-
-export interface Token {
-    symbol: string;
-    address: string;
-    decimals: number;
+interface ArbitrageAnalysis {
+    opportunity: boolean;
+    buyDEX: string;
+    sellDEX: string;
+    buyPrice: number;
+    sellPrice: number;
+    priceSpread: number;
+    tradeSizing: TradeSizing;
+    profitAnalysis: ArbitrageProfitDetails | null;
+    estimatedROI: number;
+    riskFactors: string[];
 }
 
 export class TokenFetcher {
-    private readonly DEX_ADDRESSES = {
-        UNISWAP_V2_FACTORY: '0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f',
-        SUSHISWAP_FACTORY: '0xC0AEe478e3658e2610c5F7A4A2E1777cE9e4f2Ac',
-        UNISWAP_V3_FACTORY: '0x1F98431c8aD98523631AE4a59f267346ea31F984',
-        // Note: AAVE removed - it's a lending protocol, not a DEX
-        // Additional DEXs can be added here for more arbitrage opportunities
-    };
-    private provider: ethers.JsonRpcProvider | null;
-    private demoMode: boolean = false;
-    private requestQueue: Promise<any>[] = [];
-    private lastRequestTime: number = 0;
-    private readonly REQUEST_DELAY = 100; // 100ms between requests
-    private readonly MAX_CONCURRENT_REQUESTS = 3;
+    private readonly networkType: NetworkType;
+    private readonly web3TokenFetcher: Web3TokenFetcher;
+    private readonly dexAddresses: typeof DEX_ADDRESSES[NetworkType];
 
-    constructor() {
-        try {
-            if (!process.env.INFURA_KEY) {
-                console.warn('⚠️ No INFURA_KEY found - running in demo mode');
-                this.provider = null;
-                this.demoMode = true;
-            } else {
-                this.provider = new ethers.JsonRpcProvider(`https://mainnet.infura.io/v3/${process.env.INFURA_KEY}`);
-                console.log('✅ Ethereum provider initialized with Infura');
-            }
-        } catch (error) {
-            console.error('❌ Failed to initialize provider, falling back to demo mode:', error);
-            this.provider = null;
-            this.demoMode = true;
-        }
-    }
+    constructor(networkType: NetworkType = 'arbitrum') {
+        this.networkType = networkType;
+        this.dexAddresses = DEX_ADDRESSES[networkType];
 
-    // Rate limiting wrapper for blockchain calls
-    private async rateLimit<T>(operation: () => Promise<T>): Promise<T> {
-        // Wait if we need to delay between requests
-        const now = Date.now();
-        const timeSinceLastRequest = now - this.lastRequestTime;
-        if (timeSinceLastRequest < this.REQUEST_DELAY) {
-            await new Promise(resolve => setTimeout(resolve, this.REQUEST_DELAY - timeSinceLastRequest));
-        }
+        const providerUrl = networkType === 'arbitrum' 
+            ? `https://arbitrum-mainnet.infura.io/v3/${process.env.INFURA_KEY}`
+            : `https://mainnet.infura.io/v3/${process.env.INFURA_KEY}`;
 
-        // Limit concurrent requests
-        if (this.requestQueue.length >= this.MAX_CONCURRENT_REQUESTS) {
-            await Promise.race(this.requestQueue);
-        }
-
-        this.lastRequestTime = Date.now();
-        const promise = operation();
-        this.requestQueue.push(promise);
-        
-        // Clean up completed requests
-        promise.finally(() => {
-            const index = this.requestQueue.indexOf(promise);
-            if (index > -1) {
-                this.requestQueue.splice(index, 1);
-            }
+        this.web3TokenFetcher = new Web3TokenFetcher(providerUrl, {
+            network: networkType,
+            debug: true,
+            maxRetries: 5,
+            retryDelay: 2000,
+            rateLimit: 200,
+            minLiquidityUsd: 50000
         });
-
-        return promise;
     }
 
-    async getUniswapV2Price(baseToken: Token, quoteToken: Token): Promise<PriceInfo | null> {
+    public async generateTradingPairs(batchSize: number = 100): Promise<Array<{baseToken: Token, quoteToken: Token}>> {
         try {
-            // Demo mode fallback
-            if (this.demoMode || !this.provider) {
-                console.log(`🎭 Demo mode: Simulating Uniswap V2 price for ${baseToken.symbol}/${quoteToken.symbol}`);
-                return {
-                    price: Math.random() * 0.1 + 0.001, // Random price between 0.001-0.101
-                    source: 'Uniswap V2 (Demo)',
-                    baseToken: baseToken.symbol,
-                    quoteToken: quoteToken.symbol,
-                    timestamp: Date.now(),
-                    fee: 0.003
-                };
+            const allPairs: Array<{baseToken: Token, quoteToken: Token}> = [];
+            let startIndex = 0;
+            let hasMorePairs = true;
+
+            while (hasMorePairs) {
+                const pairAddresses = await this.web3TokenFetcher.getAllPairs(startIndex, batchSize);
+                
+                if (pairAddresses.length === 0) {
+                    hasMorePairs = false;
+                    continue;
+                }
+
+                for (const pairAddress of pairAddresses) {
+                    try {
+                        const pairInfo = await this.web3TokenFetcher.getPairInfo(pairAddress);
+                        const [token0Info, token1Info] = await Promise.all([
+                            this.web3TokenFetcher.getTokenInfo(pairInfo.token0Address),
+                            this.web3TokenFetcher.getTokenInfo(pairInfo.token1Address)
+                        ]);
+
+                        allPairs.push({
+                            baseToken: token0Info,
+                            quoteToken: token1Info
+                        });
+                    } catch (error) {
+                        console.warn(`Failed to process pair ${pairAddress}:`, error);
+                        continue;
+                    }
+                }
+
+                startIndex += batchSize;
             }
 
-            console.log(`🔍 Fetching Uniswap V2 price for ${baseToken.symbol}/${quoteToken.symbol}`);
-            
-            return await this.rateLimit(async () => {
-                const factory = new ethers.Contract(
-                    this.DEX_ADDRESSES.UNISWAP_V2_FACTORY,
-                    FACTORY_ABI,
-                    this.provider
-                );
-
-                const pairAddress = await factory.getPair(baseToken.address, quoteToken.address);
-                console.log(`📍 Pair address: ${pairAddress}`);
-                
-                if (pairAddress === ethers.ZeroAddress) {
-                    console.log(`❌ No pair found for ${baseToken.symbol}/${quoteToken.symbol}`);
-                    return null;
-                }
-
-                const pair = new ethers.Contract(pairAddress, PAIR_ABI, this.provider);
-                const [token0, token1] = await Promise.all([
-                    pair.token0(),
-                    pair.token1()
-                ]);
-
-                console.log(`🔗 Token0: ${token0}, Token1: ${token1}`);
-                console.log(`🏷️ Base token (${baseToken.symbol}): ${baseToken.address}`);
-                console.log(`🏷️ Quote token (${quoteToken.symbol}): ${quoteToken.address}`);
-
-                const { reserve0, reserve1 } = await pair.getReserves();
-                console.log(`💰 Reserve0: ${reserve0.toString()}, Reserve1: ${reserve1.toString()}`);
-                
-                if (!reserve0 || !reserve1) {
-                    console.log(`❌ No reserves found`);
-                    return null;
-                }
-
-                const baseIsToken0 = baseToken.address.toLowerCase() === token0.toLowerCase();
-                console.log(`🔄 Base is token0: ${baseIsToken0}`);
-                
-                let price: number;
-                if (baseIsToken0) {
-                    // Base is token0, quote is token1: price = reserve1/reserve0
-                    price = (Number(reserve1) / 10 ** quoteToken.decimals) / (Number(reserve0) / 10 ** baseToken.decimals);
-                } else {
-                    // Base is token1, quote is token0: price = reserve0/reserve1  
-                    price = (Number(reserve0) / 10 ** quoteToken.decimals) / (Number(reserve1) / 10 ** baseToken.decimals);
-                }
-
-                console.log(`💲 Calculated price: ${price}`);
-
-                return {
-                    price,
-                    source: 'Uniswap V2',
-                    baseToken: baseToken.symbol,
-                    quoteToken: quoteToken.symbol,
-                    timestamp: Date.now(),
-                    fee: 0.003 // 0.3% trading fee
-                };
-            });
+            return allPairs;
         } catch (error) {
-            console.error(`❌ Error getting Uniswap V2 price for ${baseToken.symbol}/${quoteToken.symbol}:`, error);
-            return null;
+            console.error('Error generating trading pairs:', error);
+            return [];
         }
     }
 
-    async getUniswapV3Price(baseToken: Token, quoteToken: Token): Promise<PriceInfo | null> {
+    public async getUniswapV3Price(baseToken: Token, quoteToken: Token): Promise<PriceInfo | null> {
         try {
-            // Demo mode fallback
-            if (this.demoMode || !this.provider) {
-                console.log(`🎭 Demo mode: Simulating Uniswap V3 price for ${baseToken.symbol}/${quoteToken.symbol}`);
-                return {
-                    price: Math.random() * 0.1 + 0.001, // Random price between 0.001-0.101
-                    source: 'Uniswap V3 (Demo)',
-                    baseToken: baseToken.symbol,
-                    quoteToken: quoteToken.symbol,
-                    timestamp: Date.now(),
-                    fee: 0.003
-                };
-            }
-
-            const factory = new ethers.Contract(
-                this.DEX_ADDRESSES.UNISWAP_V3_FACTORY,
-                UNIV3_FACTORY_ABI,
-                this.provider
-            );
-
-            // Check common fee tiers
-            const fees = [500, 3000, 10000];
-            for (const fee of fees) {
-                const poolAddress = await factory.getPool(baseToken.address, quoteToken.address, fee);
-                if (poolAddress === ethers.ZeroAddress) continue;
-
-                const pair = new ethers.Contract(poolAddress, PAIR_ABI, this.provider);
-                const pool = new ethers.Contract(poolAddress, UNIV3_POOL_ABI, this.provider);
-
-                const [token0, token1] = await Promise.all([
-                    pair.token0(),
-                    pair.token1()
-                ]);
-
-                const { sqrtPriceX96 } = await pool.slot0();
-                if (!sqrtPriceX96) continue;
-
-                // Convert sqrtPriceX96 to a regular number and calculate price
-                const sqrtPrice = Number(sqrtPriceX96);
-                const denominator = 2 ** 192;  // This is a regular number, not bigint
-                const rawPrice = (sqrtPrice * sqrtPrice) / denominator;
-                
-                // Check if our base token is token0 in the pool
-                const baseIsToken0 = baseToken.address.toLowerCase() === token0.toLowerCase();
-                
-                // Adjust price based on token order and decimals
-                let price: number;
-                if (baseIsToken0) {
-                    // Base is token0, quote is token1
-                    price = rawPrice * (10 ** (baseToken.decimals - quoteToken.decimals));
-                } else {
-                    // Base is token1, quote is token0 
-                    price = (1 / rawPrice) * (10 ** (baseToken.decimals - quoteToken.decimals));
-                }
-
-                return {
-                    price,
-                    source: `Uniswap V3 (${fee/10000}%)`,
-                    baseToken: baseToken.symbol,
-                    quoteToken: quoteToken.symbol,
-                    timestamp: Date.now(),
-                    fee: fee / 1000000 // Convert basis points to decimal (500 -> 0.0005)
-                };
-            }
-            return null;
-        } catch (error) {
-            console.debug(`Error getting Uniswap V3 price for ${baseToken.symbol}/${quoteToken.symbol}:`, error);
-            return null;
-        }
-    }
-
-    async getSushiswapPrice(baseToken: Token, quoteToken: Token): Promise<PriceInfo | null> {
-        try {
-            // Demo mode fallback
-            if (this.demoMode || !this.provider) {
-                console.log(`🎭 Demo mode: Simulating Sushiswap price for ${baseToken.symbol}/${quoteToken.symbol}`);
-                return {
-                    price: Math.random() * 0.1 + 0.001, // Random price between 0.001-0.101
-                    source: 'Sushiswap (Demo)',
-                    baseToken: baseToken.symbol,
-                    quoteToken: quoteToken.symbol,
-                    timestamp: Date.now(),
-                    fee: 0.003
-                };
-            }
-
-            console.log(`🍣 Fetching Sushiswap price for ${baseToken.symbol}/${quoteToken.symbol}`);
-            
-            const factory = new ethers.Contract(
-                this.DEX_ADDRESSES.SUSHISWAP_FACTORY,
-                FACTORY_ABI,
-                this.provider
-            );
-
-            const pairAddress = await factory.getPair(baseToken.address, quoteToken.address);
-            console.log(`📍 Sushi pair address: ${pairAddress}`);
-            
-            if (pairAddress === ethers.ZeroAddress) {
-                console.log(`❌ No Sushi pair found for ${baseToken.symbol}/${quoteToken.symbol}`);
-                return null;
-            }
-
-            const pair = new ethers.Contract(pairAddress, PAIR_ABI, this.provider);
-            const [token0, token1] = await Promise.all([
-                pair.token0(),
-                pair.token1()
-            ]);
-
-            console.log(`🔗 Sushi Token0: ${token0}, Token1: ${token1}`);
-
-            const { reserve0, reserve1 } = await pair.getReserves();
-            console.log(`💰 Sushi Reserve0: ${reserve0.toString()}, Reserve1: ${reserve1.toString()}`);
-            
-            if (!reserve0 || !reserve1) {
-                console.log(`❌ No Sushi reserves found`);
-                return null;
-            }
-
-            const baseIsToken0 = baseToken.address.toLowerCase() === token0.toLowerCase();
-            console.log(`🔄 Sushi base is token0: ${baseIsToken0}`);
-            
-            let price: number;
-            if (baseIsToken0) {
-                // Base is token0, quote is token1: price = reserve1/reserve0
-                price = (Number(reserve1) / 10 ** quoteToken.decimals) / (Number(reserve0) / 10 ** baseToken.decimals);
-            } else {
-                // Base is token1, quote is token0: price = reserve0/reserve1  
-                price = (Number(reserve0) / 10 ** quoteToken.decimals) / (Number(reserve1) / 10 ** baseToken.decimals);
-            }
-
-            console.log(`💲 Sushi calculated price: ${price}`);
+            const uniV3PriceData = await this.web3TokenFetcher.getUniswapV3Price(baseToken.address, quoteToken.address);
+            if (!uniV3PriceData) return null;
 
             return {
-                price,
-                source: 'Sushiswap',
-                baseToken: baseToken.symbol,
-                quoteToken: quoteToken.symbol,
-                timestamp: Date.now(),
-                fee: 0.003 // 0.3% trading fee
+                price: uniV3PriceData.price,
+                source: "Uniswap V3",
+                baseToken: baseToken.address,
+                quoteToken: quoteToken.address,
+                timestamp: Date.now()
             };
         } catch (error) {
-            console.error(`❌ Error getting Sushiswap price for ${baseToken.symbol}/${quoteToken.symbol}:`, error);
+            console.error('Error getting Uniswap V3 price:', error);
             return null;
         }
     }
 
-    // AAVE method removed - AAVE is a lending protocol, not a DEX
-    // Flash loans from AAVE can still be used for arbitrage funding, but AAVE doesn't provide tradeable prices
+    public async getUniswapV2Price(baseToken: Token, quoteToken: Token): Promise<PriceInfo | null> {
+        try {
+            const uniV2PriceData = await this.web3TokenFetcher.getUniswapV2Price(baseToken.address, quoteToken.address);
+            if (!uniV2PriceData) return null;
 
-    async getAllPrices(baseToken: Token, quoteToken: Token): Promise<PriceInfo[]> {
+            return {
+                price: uniV2PriceData.price,
+                source: "Uniswap V2",
+                baseToken: baseToken.address,
+                quoteToken: quoteToken.address,
+                timestamp: Date.now()
+            };
+        } catch (error) {
+            console.error('Error getting Uniswap V2 price:', error);
+            return null;
+        }
+    }
+
+    public async getSushiswapPrice(baseToken: Token, quoteToken: Token): Promise<PriceInfo | null> {
+        try {
+            const sushiPriceData = await this.web3TokenFetcher.getSushiswapPrice(baseToken.address, quoteToken.address);
+            if (!sushiPriceData) return null;
+
+            return {
+                price: sushiPriceData.price,
+                source: "Sushiswap",
+                baseToken: baseToken.address,
+                quoteToken: quoteToken.address,
+                timestamp: Date.now()
+            };
+        } catch (error) {
+            console.error('Error getting Sushiswap price:', error);
+            return null;
+        }
+    }
+
+    public async getAllPrices(baseToken: Token, quoteToken: Token): Promise<PriceInfo[]> {
         const prices = await Promise.all([
-            this.getUniswapV3Price(baseToken, quoteToken),
             this.getUniswapV2Price(baseToken, quoteToken),
+            this.getUniswapV3Price(baseToken, quoteToken),
             this.getSushiswapPrice(baseToken, quoteToken)
-            // Note: AAVE is a lending protocol, not a DEX - removed from price comparison
         ]);
-
+        
         return prices.filter((price): price is PriceInfo => price !== null);
     }
 
-    async getUniswapTokens(): Promise<Token[]> {
-        const endpoints = [
-            'https://tokens.uniswap.org',
-            'https://tokens.coingecko.com/uniswap/all.json',
-            'https://gateway.ipfs.io/ipns/tokens.uniswap.org',
-            'https://token-list.sushi.com'
-        ];
-
-        const allTokens = new Set<Token>();
-
-        for (const endpoint of endpoints) {
-            try {
-                const response = await axios.get(endpoint, {
-                    timeout: 5000,
-                    headers: {
-                        'Accept': 'application/json',
-                        'User-Agent': 'Mozilla/5.0'
-                    }
-                });
-
-                let tokenList = response.data;
-                
-                // Handle different token list formats
-                if (response.data.tokens && Array.isArray(response.data.tokens)) {
-                    tokenList = response.data.tokens;
-                } else if (!Array.isArray(response.data)) {
-                    console.debug(`Invalid response from ${endpoint}: Expected array or object with tokens property`);
-                    continue;
-                }
-
-                const filteredTokens = tokenList
-                    .filter((token: any) => 
-                        token.symbol &&
-                        token.address &&
-                        token.decimals &&
-                        (token.chainId === 1 || token.chainId === '1') && // Ethereum mainnet only
-                        token.symbol !== 'unknown' &&
-                        !token.symbol.includes('UNI-V2') &&
-                        !token.symbol.includes('SLP')
-                    )
-                    .map((token: any) => ({
-                        symbol: token.symbol,
-                        address: token.address.toLowerCase(),
-                        decimals: parseInt(token.decimals)
-                    }));
-
-                if (filteredTokens.length > 0) {
-                    console.log(`Successfully fetched ${filteredTokens.length} tokens from ${endpoint}`);
-                    // Add to set to avoid duplicates
-                    filteredTokens.forEach((token: Token) => {
-                        allTokens.add(token);
-                    });
-                }
-            } catch (error: any) {
-                console.error(`Error fetching from ${endpoint}:`, error.message || 'Unknown error');
-            }
-        }
-        
-        const uniqueTokens = Array.from(allTokens);
-        console.log(`Total unique Uniswap tokens collected: ${uniqueTokens.length}`);
-        return uniqueTokens;
-    }
-
-    async getSushiswapTokens(): Promise<Token[]> {
-        const endpoints = [
-            'https://token-list.sushi.com',
-            'https://tokens.coingecko.com/uniswap/all.json',
-            'https://gateway.ipfs.io/ipns/tokens.uniswap.org',
-            'https://tokens.1inch.io'
-        ];
-
-        const allTokens = new Set<Token>();
-
-        for (const endpoint of endpoints) {
-            try {
-                const response = await axios.get(endpoint, {
-                    timeout: 5000,  // 5 second timeout
-                    headers: {
-                        'Accept': 'application/json',
-                        'User-Agent': 'Mozilla/5.0'  // Set a standard user agent
-                    }
-                });
-
-                let tokens = response.data;
-                if (response.data.tokens && Array.isArray(response.data.tokens)) {
-                    tokens = response.data.tokens;
-                } else if (!Array.isArray(response.data)) {
-                    console.debug(`Invalid response from ${endpoint}: Expected array or object with tokens property`);
-                    continue;
-                }
-
-                const filteredTokens = tokens
-                    .filter((token: any) => 
-                        token.symbol &&
-                        token.address &&
-                        token.decimals &&
-                        (token.chainId === 1 || token.chainId === '1') && // Ethereum mainnet only
-                        token.symbol !== 'unknown' &&
-                        !token.symbol.includes('SLP') &&
-                        !token.symbol.includes('UNI-V2')
-                    )
-                    .map((token: any) => ({
-                        symbol: token.symbol,
-                        address: token.address.toLowerCase(),
-                        decimals: parseInt(token.decimals)
-                    }));
-
-                if (filteredTokens.length > 0) {
-                    console.log(`Successfully fetched ${filteredTokens.length} tokens from ${endpoint}`);
-                    // Add to set to avoid duplicates
-                    filteredTokens.forEach((token: Token) => {
-                        allTokens.add(token);
-                    });
-                }
-            } catch (error: any) {  // Type assertion for error
-                console.error(`Error fetching from ${endpoint}:`, error.message || 'Unknown error');
-            }
-        }
-        
-        const uniqueTokens = Array.from(allTokens);
-        console.log(`Total unique Sushiswap tokens collected: ${uniqueTokens.length}`);
-        return uniqueTokens;
-    }
-
-    async getCurveTokens(): Promise<Token[]> {
-        const endpoints = [
-            'https://tokens.coingecko.com/uniswap/all.json',
-            'https://tokens.1inch.io', 
-            'https://gateway.ipfs.io/ipns/tokens.uniswap.org',
-            'https://token-list.sushi.com'
-        ];
-
-        const tokens = new Set<Token>();
-
-        for (const endpoint of endpoints) {
-            try {
-                const response = await axios.get(endpoint, {
-                    timeout: 5000,  // 5 second timeout
-                    headers: {
-                        'Accept': 'application/json',
-                        'User-Agent': 'Mozilla/5.0'  // Standard user agent
-                    }
-                });
-
-                if (endpoint.includes('curve-token-list')) {
-                    // Handle GitHub token list format
-                    if (Array.isArray(response.data)) {
-                        response.data.forEach((token: any) => {
-                            if (token.address && token.symbol && token.decimals) {
-                                tokens.add({
-                                    symbol: token.symbol,
-                                    address: token.address.toLowerCase(),
-                                    decimals: parseInt(token.decimals)
-                                });
-                            }
-                        });
-                    }
-                } else {
-                    // Handle Curve API format
-                    if (response.data?.data?.poolData) {
-                        response.data.data.poolData.forEach((pool: any) => {
-                            if (pool.coins && Array.isArray(pool.coins)) {
-                                pool.coins.forEach((coin: any) => {
-                                    if (coin.address && coin.symbol && typeof coin.decimals !== 'undefined') {
-                                        tokens.add({
-                                            symbol: coin.symbol,
-                                            address: coin.address.toLowerCase(),
-                                            decimals: parseInt(coin.decimals)
-                                        });
-                                    }
-                                });
-                            }
-                        });
-                    }
-                }
-            } catch (error: any) {  // Type assertion for error
-                console.error(`Error fetching from ${endpoint}:`, error.message || 'Unknown error');
-                continue;
-            }
-        }
-
-        const tokenArray = Array.from(tokens);
-        if (tokenArray.length > 0) {
-            console.log(`Successfully fetched ${tokenArray.length} tokens from Curve sources`);
-            return tokenArray;
-        }
-
-        console.warn('All Curve token endpoints failed');
-        return [];
-    }
-
-    async getAllTokens(): Promise<Map<string, Token>> {
-        const tokenMap = new Map<string, Token>();
-        
-        // Common stablecoin addresses (as a fallback)
-        const commonTokens: Token[] = [
-            { symbol: 'WETH', address: '0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2', decimals: 18 },
-            { symbol: 'USDC', address: '0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48', decimals: 6 },
-            { symbol: 'USDT', address: '0xdac17f958d2ee523a2206206994597c13d831ec7', decimals: 6 },
-            { symbol: 'DAI', address: '0x6b175474e89094c44da98b954eedeac495271d0f', decimals: 18 },
-            { symbol: 'WBTC', address: '0x2260fac5e5542a773aa44fbcfedf7c193bc2c599', decimals: 8 }
-        ];
-        
-        try {
-            console.log('Fetching tokens from Uniswap V3...');
-            const uniTokens = await this.getUniswapTokens();
-            console.log(`Found ${uniTokens.length} tokens on Uniswap V3`);
-
-            console.log('Fetching tokens from Sushiswap...');
-            const sushiTokens = await this.getSushiswapTokens();
-            console.log(`Found ${sushiTokens.length} tokens on Sushiswap`);
-
-            console.log('Fetching tokens from Curve...');
-            const curveTokens = await this.getCurveTokens();
-            console.log(`Found ${curveTokens.length} tokens on Curve`);
-
-            // Combine tokens from all sources and deduplicate by address
-            [...uniTokens, ...sushiTokens, ...curveTokens, ...commonTokens].forEach((token: Token) => {
-                const lowerAddress = token.address.toLowerCase();
-                if (!tokenMap.has(lowerAddress)) {
-                    tokenMap.set(lowerAddress, {
-                        ...token,
-                        address: lowerAddress
-                    });
-                }
-            });
-
-            const totalTokens = tokenMap.size;
-            console.log(`Total unique tokens found: ${totalTokens}`);
-
-            // If we have very few tokens, something might be wrong
-            if (totalTokens < 10) {
-                console.warn('Warning: Found very few tokens. Some DEX APIs might be failing.');
-                console.warn('Proceeding with available tokens...');
-            }
-
-        } catch (error) {
-            console.error('Error in getAllTokens:', error);
-            // If everything fails, at least use the common tokens
-            commonTokens.forEach((token: Token) => {
-                const lowerAddress = token.address.toLowerCase();
-                tokenMap.set(lowerAddress, {
-                    ...token,
-                    address: lowerAddress
-                });
-            });
-        }
-
-        return tokenMap;
-    }
-
-    async getTokenPrice(baseToken: Token, quoteToken: Token): Promise<{ price: number; source: string; fee: number }> {
-        // Addresses of major DEX contracts
-        const UNISWAP_V2_FACTORY = '0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f';
-        const SUSHISWAP_FACTORY = '0xC0AEe478e3658e2610c5F7A4A2E1777cE9e4f2Ac';
-        const UNISWAP_V3_FACTORY = '0x1F98431c8aD98523631AE4a59f267346ea31F984';
-        
-        try {
-            // Load factory contracts
-            const uniV2Factory = new ethers.Contract(
-                UNISWAP_V2_FACTORY,
-                ['function getPair(address tokenA, address tokenB) view returns (address pair)'],
-                this.provider
-            );
-            
-            const sushiFactory = new ethers.Contract(
-                SUSHISWAP_FACTORY,
-                ['function getPair(address tokenA, address tokenB) view returns (address pair)'],
-                this.provider
-            );
-            
-            const uniV3Factory = new ethers.Contract(
-                UNISWAP_V3_FACTORY,
-                ['function getPool(address tokenA, address tokenB, uint24 fee) view returns (address pool)'],
-                this.provider
-            );
-
-            // Try Uniswap V3 first (most liquid)
-            const fees = [3000, 500, 10000]; // 0.3%, 0.05%, 1% fee tiers
-            for (const fee of fees) {
-                const poolAddress = await uniV3Factory.getPool(baseToken.address, quoteToken.address, fee);
-                if (poolAddress !== ethers.ZeroAddress) {
-                    const pool = new ethers.Contract(
-                        poolAddress,
-                        ['function slot0() view returns (uint160 sqrtPriceX96, int24 tick, uint16 observationIndex, uint16 observationCardinality, uint16 observationCardinalityNext, uint8 feeProtocol, bool unlocked)'],
-                        this.provider
-                    );
-                    
-                    const pair = new ethers.Contract(poolAddress, PAIR_ABI, this.provider);
-                    const [token0, token1] = await Promise.all([
-                        pair.token0(),
-                        pair.token1()
-                    ]);
-                    
-                    const { sqrtPriceX96 } = await pool.slot0();
-                    
-                    // Convert sqrtPriceX96 to a regular number and calculate price
-                    const sqrtPrice = Number(sqrtPriceX96);
-                    const denominator = 2 ** 192;  // This is a regular number, not bigint
-                    const basePrice = (sqrtPrice * sqrtPrice) / denominator;
-                    
-                    // Check if our base token is token0 in the pool
-                    const baseIsToken0 = baseToken.address.toLowerCase() === token0.toLowerCase();
-                    
-                    // Calculate final price with decimal adjustment
-                    const price = baseIsToken0 
-                        ? basePrice * (10 ** (quoteToken.decimals - baseToken.decimals))
-                        : (1 / basePrice) * (10 ** (quoteToken.decimals - baseToken.decimals));
-                    
-                    return { price, source: `Uniswap V3 (${fee/10000}%)`, fee: fee / 1000000 };
-                }
-            }
-
-            // Try Uniswap V2
-            const uniV2PairAddress = await uniV2Factory.getPair(baseToken.address, quoteToken.address);
-            if (uniV2PairAddress !== ethers.ZeroAddress) {
-                const pair = new ethers.Contract(uniV2PairAddress, PAIR_ABI, this.provider);
-                const [token0, token1] = await Promise.all([
-                    pair.token0(),
-                    pair.token1()
-                ]);
-                
-                const { reserve0, reserve1 } = await pair.getReserves();
-                const baseIsToken0 = baseToken.address.toLowerCase() === token0.toLowerCase();
-                const price = baseIsToken0
-                    ? (Number(reserve1) / Number(reserve0)) * (10 ** (quoteToken.decimals - baseToken.decimals))
-                    : (Number(reserve0) / Number(reserve1)) * (10 ** (quoteToken.decimals - baseToken.decimals));
-                    
-                return { price, source: 'Uniswap V2', fee: 0.003 };
-            }
-
-            // Try Sushiswap
-            const sushiPairAddress = await sushiFactory.getPair(baseToken.address, quoteToken.address);
-            if (sushiPairAddress !== ethers.ZeroAddress) {
-                const pair = new ethers.Contract(sushiPairAddress, PAIR_ABI, this.provider);
-                const [token0, token1] = await Promise.all([
-                    pair.token0(),
-                    pair.token1()
-                ]);
-                
-                const { reserve0, reserve1 } = await pair.getReserves();
-                const baseIsToken0 = baseToken.address.toLowerCase() === token0.toLowerCase();
-                const price = baseIsToken0
-                    ? (Number(reserve1) / Number(reserve0)) * (10 ** (quoteToken.decimals - baseToken.decimals))
-                    : (Number(reserve0) / Number(reserve1)) * (10 ** (quoteToken.decimals - baseToken.decimals));
-                    
-                return { price, source: 'Sushiswap', fee: 0.003 };
-            }
-
-            throw new Error('No liquidity found in major DEXs');
-        } catch (error) {
-            console.error('Error getting token price:', error);
-            throw error;
-        }
-    }
-
-    async generateTradingPairs(): Promise<Array<{baseToken: Token, quoteToken: Token}>> {
-        const tokenMap = await this.getAllTokens();
-        const tokens = Array.from(tokenMap.values());
-        const pairs = [];
-        
-        // Define major tokens to prioritize
-        const majorTokens = new Set([
-            '0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2', // WETH
-            '0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48', // USDC
-            '0xdac17f958d2ee523a2206206994597c13d831ec7', // USDT
-            '0x6b175474e89094c44da98b954eedeac495271d0f', // DAI
-            '0x2260fac5e5542a773aa44fbcfedf7c193bc2c599'  // WBTC
-        ]);
-
-        // Generate pairs ensuring at least one major token
-        for (let i = 0; i < tokens.length; i++) {
-            for (let j = i + 1; j < tokens.length; j++) {
-                const token1 = tokens[i];
-                const token2 = tokens[j];
-                
-                // Skip pairs where both tokens are unknown
-                if (!majorTokens.has(token1.address.toLowerCase()) && 
-                    !majorTokens.has(token2.address.toLowerCase())) {
-                    continue;
-                }
-
-                // Skip pairs where one of the tokens is a wrapped version of the other
-                if (
-                    (token1.symbol.includes(token2.symbol) && token1.symbol.startsWith('W')) ||
-                    (token2.symbol.includes(token1.symbol) && token2.symbol.startsWith('W'))
-                ) {
-                    continue;
-                }
-
-                // Always put WETH as the quote token if possible
-                // For other pairs, put the more liquid token as quote
-                const token1IsWETH = token1.address.toLowerCase() === '0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2';
-                const token2IsWETH = token2.address.toLowerCase() === '0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2';
-                
-                if (token1IsWETH || token2IsWETH) {
-                    // Always put WETH as quote token
-                    pairs.push({
-                        baseToken: token1IsWETH ? token2 : token1,
-                        quoteToken: token1IsWETH ? token1 : token2
-                    });
-                } else {
-                    // For non-WETH pairs, put the more liquid token (likely stablecoin) as quote
-                    const token1IsStable = ['USDC', 'USDT', 'DAI', 'BUSD'].includes(token1.symbol);
-                    const token2IsStable = ['USDC', 'USDT', 'DAI', 'BUSD'].includes(token2.symbol);
-                    
-                    if (token1IsStable) {
-                        pairs.push({
-                            baseToken: token2,
-                            quoteToken: token1
-                        });
-                    } else if (token2IsStable) {
-                        pairs.push({
-                            baseToken: token1,
-                            quoteToken: token2
-                        });
-                    } else {
-                        // If neither is stable, use the more "major" token as quote
-                        if (majorTokens.has(token1.address.toLowerCase())) {
-                            pairs.push({
-                                baseToken: token2,
-                                quoteToken: token1
-                            });
-                        } else {
-                            pairs.push({
-                                baseToken: token1,
-                                quoteToken: token2
-                            });
-                        }
-                    }
-                }
-            }
-        }
-
-        console.log(`Generated ${pairs.length} valid trading pairs`);
-        return pairs;
-    }
-
-    /**
-     * Calculate flash loan arbitrage profit after accounting for all fees AND slippage
-     * @param buyPrice Price to buy at on DEX A
-     * @param sellPrice Price to sell at on DEX B
-     * @param buyDexFee Trading fee for DEX A (as decimal, e.g., 0.003 for 0.3%)
-     * @param sellDexFee Trading fee for DEX B (as decimal, e.g., 0.003 for 0.3%)
-     * @param flashLoanFee AAVE flash loan fee (as decimal, e.g., 0.001 for 0.1%)
-     * @param gasFeesUSD Estimated gas fees in USD for all transactions
-     * @param amount Amount to trade (in base token units)
-     * @param buySlippage Expected slippage on buy DEX (as decimal, e.g., 0.01 for 1%)
-     * @param sellSlippage Expected slippage on sell DEX (as decimal, e.g., 0.01 for 1%)
-     * @returns Net profit after all fees, costs, and slippage
-     */
-    calculateArbitrageProfit(
+    private calculateArbitrageProfit(
         buyPrice: number,
         sellPrice: number,
         buyDexFee: number,
         sellDexFee: number,
-        flashLoanFee: number = 0.001, // Default AAVE 0.1%
-        gasFeesUSD: number = 50, // Default $50 gas estimate
-        amount: number = 1000, // Default 1000 tokens for meaningful arbitrage
-        buySlippage: number = 0.005, // Default 0.5% slippage on buy
-        sellSlippage: number = 0.005 // Default 0.5% slippage on sell
-    ): { 
-        grossProfit: number; 
-        netProfit: number; 
-        totalFees: number;
-        totalFeesPercent: number;
-        profitMargin: number; 
-        viable: boolean;
-        slippageImpact: number;
-        breakdown: {
-            revenue: number;
-            buyCost: number;
-            flashLoanCost: number;
-            gasCost: number;
-            totalCosts: number;
-            slippageCost: number;
-        }
-    } {
-        // Step 1: Apply slippage to prices
-        const effectiveBuyPrice = buyPrice * (1 + buySlippage); // Higher price due to slippage
-        const effectiveSellPrice = sellPrice * (1 - sellSlippage); // Lower price due to slippage
+        flashLoanFee: number,
+        gasFeesUSD: number,
+        amount: number,
+        buySlippage: number = 0.01,
+        sellSlippage: number = 0.01
+    ): ArbitrageProfitDetails {
+        // Calculate amounts after slippage
+        const effectiveBuyPrice = buyPrice * (1 + buySlippage);
+        const effectiveSellPrice = sellPrice * (1 - sellSlippage);
         
-        // Step 2: Calculate revenue from selling (with slippage)
-        const grossRevenue = amount * effectiveSellPrice;
-        const sellFeeAmount = grossRevenue * sellDexFee;
-        const netRevenue = grossRevenue - sellFeeAmount;
+        // Calculate trade amounts
+        const buyAmount = amount;
+        const buyTotalWithFee = buyAmount * effectiveBuyPrice * (1 + buyDexFee);
+        const sellAmount = buyAmount * (1 - flashLoanFee);
+        const sellTotalWithFee = sellAmount * effectiveSellPrice * (1 - sellDexFee);
         
-        // Step 3: Calculate costs (with slippage)
-        const buyAmount = amount * effectiveBuyPrice;
-        const buyFeeAmount = buyAmount * buyDexFee;
-        const buyCost = buyAmount + buyFeeAmount;
+        // Calculate fees
+        const buyFees = buyAmount * effectiveBuyPrice * buyDexFee;
+        const sellFees = sellAmount * effectiveSellPrice * sellDexFee;
+        const flashLoanFees = buyAmount * effectiveSellPrice * flashLoanFee;
         
-        // Step 4: Flash loan fee (charged on the borrowed amount)
-        const flashLoanCost = buyAmount * flashLoanFee;
+        // Calculate profit metrics
+        const grossProfit = sellTotalWithFee - buyTotalWithFee;
+        const totalFees = buyFees + sellFees + flashLoanFees + gasFeesUSD;
+        const netProfit = grossProfit - totalFees;
+        const totalFeesPercent = (totalFees / buyTotalWithFee) * 100;
+        const profitMargin = (netProfit / buyTotalWithFee) * 100;
         
-        // Step 5: Calculate slippage impact
-        const slippageCost = (amount * buyPrice * buySlippage) + (amount * sellPrice * sellSlippage);
-        
-        // Step 6: Total costs
-        const totalCosts = buyCost + flashLoanCost + gasFeesUSD;
-        
-        // Step 7: Calculate profits
-        const grossProfit = (amount * sellPrice) - (amount * buyPrice); // Before fees and slippage
-        const netProfit = netRevenue - totalCosts;
-        const totalFees = sellFeeAmount + buyFeeAmount + flashLoanCost + gasFeesUSD;
-        const totalFeesPercent = (totalFees / (amount * buyPrice)) * 100;
-        const profitMargin = netProfit / (amount * buyPrice); // Profit margin on investment
+        // Calculate slippage impact
+        const slippageImpact = (
+            (effectiveBuyPrice - buyPrice) * buyAmount +
+            (sellPrice - effectiveSellPrice) * sellAmount
+        );
         
         return {
             grossProfit,
@@ -853,303 +234,105 @@ export class TokenFetcher {
             totalFeesPercent,
             profitMargin,
             viable: netProfit > 0,
-            slippageImpact: slippageCost,
+            slippageImpact,
             breakdown: {
-                revenue: netRevenue,
-                buyCost,
-                flashLoanCost,
-                gasCost: gasFeesUSD,
-                totalCosts,
-                slippageCost
+                buyAmount,
+                sellAmount,
+                buyFees,
+                sellFees,
+                flashLoanFees,
+                gasFees: gasFeesUSD
             }
         };
     }
 
-    /**
-     * Estimate slippage based on trade size and pool liquidity
-     * @param tradeAmount Amount to trade (in tokens)
-     * @param tokenPrice Current token price
-     * @param poolLiquidityUSD Estimated pool liquidity in USD
-     * @param poolType Type of pool ('uni-v2', 'uni-v3', 'sushi')
-     * @returns Estimated slippage as decimal (0.01 = 1%)
-     */
-    estimateSlippage(
-        tradeAmount: number,
-        tokenPrice: number,
-        poolLiquidityUSD: number,
-        poolType: 'uni-v2' | 'uni-v3' | 'sushi' | 'aave' = 'uni-v2'
-    ): number {
-        const tradeValueUSD = tradeAmount * tokenPrice;
-        const tradeImpact = tradeValueUSD / poolLiquidityUSD;
-        
-        // Different slippage models for different pool types
-        let baseSlippage: number;
-        
-        switch (poolType) {
-            case 'uni-v3':
-                // Uniswap V3 has concentrated liquidity, can be more efficient
-                baseSlippage = Math.sqrt(tradeImpact) * 0.3;
-                break;
-            case 'uni-v2':
-            case 'sushi':
-                // Uniswap V2 and Sushiswap use constant product formula
-                baseSlippage = Math.sqrt(tradeImpact) * 0.5;
-                break;
-            case 'aave':
-                // AAVE typically has less slippage for supported assets
-                baseSlippage = Math.sqrt(tradeImpact) * 0.2;
-                break;
-            default:
-                baseSlippage = Math.sqrt(tradeImpact) * 0.5;
-        }
-        
-        // Cap slippage at reasonable levels
-        return Math.min(baseSlippage, 0.1); // Max 10% slippage
-    }
-
-    /**
-     * Get optimal trade size considering slippage
-     * @param buyPrice Price on buy DEX
-     * @param sellPrice Price on sell DEX  
-     * @param buyPoolLiquidity Liquidity on buy DEX (USD)
-     * @param sellPoolLiquidity Liquidity on sell DEX (USD)
-     * @param maxSlippage Maximum acceptable slippage (decimal)
-     * @returns Optimal trade amount in tokens
-     */
-    getOptimalTradeSize(
-        buyPrice: number,
-        sellPrice: number,
-        buyPoolLiquidity: number,
-        sellPoolLiquidity: number,
-        maxSlippage: number = 0.02 // 2% max slippage
-    ): number {
-        // Find the trade size that maximizes profit while staying under slippage limit
-        const minLiquidity = Math.min(buyPoolLiquidity, sellPoolLiquidity);
-        
-        // Start with a conservative trade size (1% of pool liquidity)
-        let maxTradeValue = minLiquidity * 0.01;
-        
-        // Adjust based on slippage tolerance
-        const slippageConstrainedValue = (maxSlippage * maxSlippage) * minLiquidity / 0.25; // Simplified formula
-        maxTradeValue = Math.min(maxTradeValue, slippageConstrainedValue);
-        
-        // Convert to token amount
-        const optimalAmount = Math.floor(maxTradeValue / buyPrice);
-        
-        // Ensure minimum viable trade size
-        return Math.max(optimalAmount, 1000); // At least 1000 tokens
-    }
-
-    /**
-     * Calculate the minimum profitable trade amount for arbitrage
-     * @param buyPrice Price on buy DEX
-     * @param sellPrice Price on sell DEX
-     * @param buyDexFee Trading fee for buy DEX
-     * @param sellDexFee Trading fee for sell DEX
-     * @param flashLoanFee Flash loan fee (default 0.1%)
-     * @param gasFeesUSD Gas costs in USD
-     * @param minProfitUSD Minimum profit target in USD
-     * @param buyPoolLiquidity Buy DEX liquidity in USD
-     * @param sellPoolLiquidity Sell DEX liquidity in USD
-     * @param maxSlippage Maximum acceptable slippage
-     * @returns Minimum trade amount needed for profitability
-     */
-    calculateMinimumProfitableAmount(
+    private findOptimalTradeSize(
         buyPrice: number,
         sellPrice: number,
         buyDexFee: number,
         sellDexFee: number,
-        flashLoanFee: number = 0.001,
-        gasFeesUSD: number = 50,
-        minProfitUSD: number = 100, // Target $100 minimum profit
-        buyPoolLiquidity: number = 1000000,
-        sellPoolLiquidity: number = 1000000,
-        maxSlippage: number = 0.02
-    ): {
-        minAmount: number;
-        maxAmount: number;
-        recommendedAmount: number;
-        profitable: boolean;
-        reason: string;
-    } {
-        // Check if arbitrage is theoretically possible
-        if (sellPrice <= buyPrice) {
-            return {
-                minAmount: 0,
-                maxAmount: 0,
-                recommendedAmount: 0,
-                profitable: false,
-                reason: 'No price difference - sell price must be higher than buy price'
-            };
-        }
-
-        // Binary search to find minimum profitable amount
-        let minAmount = 100; // Start with 100 tokens
-        let maxTestAmount = Math.min(
-            buyPoolLiquidity / buyPrice * 0.1, // Max 10% of pool liquidity
-            sellPoolLiquidity / sellPrice * 0.1
-        );
-
-        let foundProfitable = false;
+        gasFeesUSD: number,
+        maxSlippage: number = 0.03,
+        baseTokenSymbol: string = 'TOKEN'
+    ): TradeSizing {
+        // Define search parameters
+        const minTradeUSD = 1000; // $1,000 minimum trade size
+        const maxTradeUSD = 1000000; // $1M maximum trade size
+        
+        const testAmounts = [
+            1000,    // $1K
+            5000,    // $5K
+            10000,   // $10K
+            25000,   // $25K
+            50000,   // $50K
+            100000,  // $100K
+            250000,  // $250K
+            500000,  // $500K
+            1000000  // $1M
+        ];
+        
+        let bestNetProfit = 0;
         let bestAmount = 0;
-        let iterations = 0;
-        const maxIterations = 20;
-
-        while (iterations < maxIterations && minAmount <= maxTestAmount) {
-            const testAmount = (minAmount + maxTestAmount) / 2;
+        let minProfitableAmount = Infinity;
+        let maxProfitableAmount = 0;
+        
+        for (const amountUSD of testAmounts) {
+            const amount = amountUSD / buyPrice;
             
-            // Estimate slippage for this trade size
-            const buySlippage = this.estimateSlippage(testAmount, buyPrice, buyPoolLiquidity, 'uni-v2');
-            const sellSlippage = this.estimateSlippage(testAmount, sellPrice, sellPoolLiquidity, 'uni-v2');
-            
-            // Check if slippage is acceptable
-            if (buySlippage > maxSlippage || sellSlippage > maxSlippage) {
-                maxTestAmount = testAmount - 1;
-                iterations++;
-                continue;
-            }
-
-            // Calculate profit for this amount
-            const result = this.calculateArbitrageProfit(
+            const profitDetails = this.calculateArbitrageProfit(
                 buyPrice,
                 sellPrice,
                 buyDexFee,
                 sellDexFee,
-                flashLoanFee,
-                gasFeesUSD,
-                testAmount,
-                buySlippage,
-                sellSlippage
-            );
-
-            if (result.netProfit >= minProfitUSD) {
-                foundProfitable = true;
-                bestAmount = testAmount;
-                maxTestAmount = testAmount - 1; // Try to find smaller amount
-            } else {
-                minAmount = testAmount + 1; // Need larger amount
-            }
-            
-            iterations++;
-        }
-
-        if (!foundProfitable) {
-            // Check why it's not profitable
-            const testResult = this.calculateArbitrageProfit(
-                buyPrice,
-                sellPrice,
-                buyDexFee,
-                sellDexFee,
-                flashLoanFee,
-                gasFeesUSD,
-                1000,
-                0.005,
-                0.005
-            );
-
-            let reason = 'Insufficient profit margin';
-            if (testResult.netProfit < 0) {
-                if (testResult.totalFees > testResult.grossProfit) {
-                    reason = 'Trading fees exceed gross profit';
-                } else if (testResult.slippageImpact > testResult.grossProfit) {
-                    reason = 'Slippage impact exceeds gross profit';
-                } else {
-                    reason = 'Gas fees too high relative to profit potential';
-                }
-            }
-
-            return {
-                minAmount: 0,
-                maxAmount: 0,
-                recommendedAmount: 0,
-                profitable: false,
-                reason
-            };
-        }
-
-        // Find optimal amount (maximize profit within constraints)
-        let optimalAmount = bestAmount;
-        let maxProfit = 0;
-
-        for (let amount = bestAmount; amount <= maxTestAmount * 2; amount += bestAmount * 0.1) {
-            const buySlippage = this.estimateSlippage(amount, buyPrice, buyPoolLiquidity, 'uni-v2');
-            const sellSlippage = this.estimateSlippage(amount, sellPrice, sellPoolLiquidity, 'uni-v2');
-            
-            if (buySlippage > maxSlippage || sellSlippage > maxSlippage) {
-                break;
-            }
-
-            const result = this.calculateArbitrageProfit(
-                buyPrice,
-                sellPrice,
-                buyDexFee,
-                sellDexFee,
-                flashLoanFee,
+                0.001, // Flash loan fee (0.1%)
                 gasFeesUSD,
                 amount,
-                buySlippage,
-                sellSlippage
+                maxSlippage,
+                maxSlippage
             );
-
-            if (result.netProfit > maxProfit) {
-                maxProfit = result.netProfit;
-                optimalAmount = amount;
-            } else {
-                break; // Profit is decreasing, we found the optimal point
+            
+            if (profitDetails.netProfit > 0) {
+                if (amountUSD < minProfitableAmount) minProfitableAmount = amountUSD;
+                if (amountUSD > maxProfitableAmount) maxProfitableAmount = amountUSD;
+                
+                if (profitDetails.netProfit > bestNetProfit) {
+                    bestNetProfit = profitDetails.netProfit;
+                    bestAmount = amountUSD;
+                }
             }
         }
-
+        
+        // Return results
+        if (bestAmount === 0) {
+            return {
+                minAmount: 0,
+                maxAmount: 0,
+                recommendedAmount: 0,
+                profitable: false,
+                reason: `No profitable trade size found for ${baseTokenSymbol}`
+            };
+        }
+        
+        // Conservative recommendation: use the profitable amount with good risk/reward
         return {
-            minAmount: Math.floor(bestAmount),
-            maxAmount: Math.floor(maxTestAmount),
-            recommendedAmount: Math.floor(optimalAmount),
+            minAmount: minProfitableAmount,
+            maxAmount: maxProfitableAmount,
+            recommendedAmount: bestAmount,
             profitable: true,
-            reason: `Profitable with minimum $${minProfitUSD} target`
+            reason: `Optimal trade size identified for ${baseTokenSymbol}`
         };
     }
 
-    /**
-     * Comprehensive arbitrage analysis with optimal trade sizing
-     * @param baseToken The token to arbitrage
-     * @param quoteToken The quote token (usually WETH, USDC)
-     * @param minProfitUSD Minimum profit target
-     * @returns Complete arbitrage opportunity analysis
-     */
-    async analyzeArbitrageOpportunity(
+    public async analyzeArbitrageOpportunity(
         baseToken: Token,
         quoteToken: Token,
         minProfitUSD: number = 100
-    ): Promise<{
-        opportunity: boolean;
-        buyDEX: string;
-        sellDEX: string;
-        buyPrice: number;
-        sellPrice: number;
-        priceSpread: number;
-        tradeSizing: {
-            minAmount: number;
-            maxAmount: number;
-            recommendedAmount: number;
-            profitable: boolean;
-            reason: string;
-        };
-        profitAnalysis: {
-            grossProfit: number;
-            netProfit: number;
-            totalFees: number;
-            totalFeesPercent: number;
-            profitMargin: number;
-            viable: boolean;
-            slippageImpact: number;
-            breakdown: any;
-        } | null;
-        estimatedROI: number;
-        riskFactors: string[];
-    }> {
+    ): Promise<ArbitrageAnalysis> {
         try {
-            // Get prices from all DEXs
+            // Get prices from different DEXs
             const prices = await this.getAllPrices(baseToken, quoteToken);
             
+            // Need at least 2 different prices for arbitrage
             if (prices.length < 2) {
                 return {
                     opportunity: false,
@@ -1163,104 +346,124 @@ export class TokenFetcher {
                         maxAmount: 0,
                         recommendedAmount: 0,
                         profitable: false,
-                        reason: 'Insufficient liquidity sources'
+                        reason: 'Insufficient price data'
                     },
                     profitAnalysis: null,
                     estimatedROI: 0,
-                    riskFactors: ['Insufficient DEX coverage']
+                    riskFactors: ['Insufficient price data']
                 };
             }
-
-            // Find best buy (lowest price) and sell (highest price) opportunities
-            const sortedPrices = prices.sort((a, b) => a.price - b.price);
-            const buyOption = sortedPrices[0];
-            const sellOption = sortedPrices[sortedPrices.length - 1];
-
-            const priceSpread = ((sellOption.price - buyOption.price) / buyOption.price) * 100;
-
-            // Skip if spread is too small (less than 0.5%)
+            
+            // Find best prices for buy and sell
+            let lowestPrice = Infinity;
+            let highestPrice = -Infinity;
+            let bestBuyDEX = '';
+            let bestSellDEX = '';
+            
+            prices.forEach(price => {
+                if (price.price < lowestPrice) {
+                    lowestPrice = price.price;
+                    bestBuyDEX = price.source;
+                }
+                if (price.price > highestPrice) {
+                    highestPrice = price.price;
+                    bestSellDEX = price.source;
+                }
+            });
+            
+            // Calculate price spread
+            const priceSpread = ((highestPrice - lowestPrice) / lowestPrice) * 100;
+            
+            // Early exit if spread is too small
             if (priceSpread < 0.5) {
                 return {
                     opportunity: false,
-                    buyDEX: buyOption.source,
-                    sellDEX: sellOption.source,
-                    buyPrice: buyOption.price,
-                    sellPrice: sellOption.price,
+                    buyDEX: bestBuyDEX,
+                    sellDEX: bestSellDEX,
+                    buyPrice: lowestPrice,
+                    sellPrice: highestPrice,
                     priceSpread,
                     tradeSizing: {
                         minAmount: 0,
                         maxAmount: 0,
                         recommendedAmount: 0,
                         profitable: false,
-                        reason: 'Price spread too small for profitable arbitrage'
+                        reason: 'Insufficient price spread'
                     },
                     profitAnalysis: null,
                     estimatedROI: 0,
-                    riskFactors: ['Minimal price spread']
+                    riskFactors: ['Price spread too small']
                 };
             }
-
-            // Estimate pool liquidity (simplified)
-            const estimatedLiquidity = 1000000; // $1M default - would need actual pool data
-
-            // Calculate optimal trade sizing
-            const tradeSizing = this.calculateMinimumProfitableAmount(
-                buyOption.price,
-                sellOption.price,
-                buyOption.fee,
-                sellOption.fee,
-                0.001, // AAVE flash loan fee
-                50, // Gas fees
-                minProfitUSD,
-                estimatedLiquidity,
-                estimatedLiquidity
+            
+            // Get DEX fees based on sources
+            const getBuyDexFee = (dex: string) => {
+                switch (dex) {
+                    case 'Uniswap V3': return 0.003; // 0.3%
+                    case 'Uniswap V2': return 0.003; // 0.3%
+                    case 'Sushiswap': return 0.003;  // 0.3%
+                    default: return 0.003;           // Default to 0.3%
+                }
+            };
+            
+            const buyDexFee = getBuyDexFee(bestBuyDEX);
+            const sellDexFee = getBuyDexFee(bestSellDEX);
+            
+            // Estimate gas costs (in USD)
+            const estimatedGasUnits = 500000; // Rough estimate for arbitrage transaction
+            const gasPrice = 0.1 * 1e-9; // 0.1 gwei
+            const ethPrice = 1800; // Rough ETH price estimate
+            const gasFeesUSD = estimatedGasUnits * gasPrice * ethPrice;
+            
+            // Find optimal trade size
+            const tradeSizing = this.findOptimalTradeSize(
+                lowestPrice,
+                highestPrice,
+                buyDexFee,
+                sellDexFee,
+                gasFeesUSD,
+                0.01, // 1% max slippage
+                baseToken.symbol
             );
-
-            let profitAnalysis = null;
-            let estimatedROI = 0;
+            
+            // Calculate profit analysis if trade size is profitable
+            const profitAnalysis = tradeSizing.profitable 
+                ? this.calculateArbitrageProfit(
+                    lowestPrice,
+                    highestPrice,
+                    buyDexFee,
+                    sellDexFee,
+                    0.001, // Flash loan fee
+                    gasFeesUSD,
+                    tradeSizing.recommendedAmount / lowestPrice // Convert USD to token amount
+                )
+                : null;
+            
+            // Calculate estimated ROI
+            const estimatedROI = profitAnalysis 
+                ? (profitAnalysis.netProfit / (tradeSizing.recommendedAmount)) * 100 
+                : 0;
+            
+            // Define risk factors
             const riskFactors: string[] = [];
-
-            if (tradeSizing.profitable) {
-                // Calculate detailed profit analysis for recommended amount
-                const buySlippage = this.estimateSlippage(tradeSizing.recommendedAmount, buyOption.price, estimatedLiquidity);
-                const sellSlippage = this.estimateSlippage(tradeSizing.recommendedAmount, sellOption.price, estimatedLiquidity);
-
-                profitAnalysis = this.calculateArbitrageProfit(
-                    buyOption.price,
-                    sellOption.price,
-                    buyOption.fee,
-                    sellOption.fee,
-                    0.001,
-                    50,
-                    tradeSizing.recommendedAmount,
-                    buySlippage,
-                    sellSlippage
-                );
-
-                estimatedROI = (profitAnalysis.netProfit / (tradeSizing.recommendedAmount * buyOption.price)) * 100;
-
-                // Assess risk factors
-                if (buySlippage > 0.01) riskFactors.push('High buy slippage risk');
-                if (sellSlippage > 0.01) riskFactors.push('High sell slippage risk');
-                if (profitAnalysis.totalFeesPercent > 2) riskFactors.push('High fee impact');
-                if (estimatedROI < 1) riskFactors.push('Low profit margin');
-            } else {
-                riskFactors.push('Not profitable at current market conditions');
-            }
-
+            if (priceSpread > 5) riskFactors.push('Large price spread - high volatility risk');
+            if (estimatedROI < 1) riskFactors.push('Low ROI');
+            if (tradeSizing.recommendedAmount > 100000) riskFactors.push('Large trade size');
+            if (profitAnalysis && profitAnalysis.slippageImpact > 100) riskFactors.push('High slippage impact');
+            
             return {
-                opportunity: tradeSizing.profitable,
-                buyDEX: buyOption.source,
-                sellDEX: sellOption.source,
-                buyPrice: buyOption.price,
-                sellPrice: sellOption.price,
+                opportunity: profitAnalysis?.netProfit ? profitAnalysis.netProfit >= minProfitUSD : false,
+                buyDEX: bestBuyDEX,
+                sellDEX: bestSellDEX,
+                buyPrice: lowestPrice,
+                sellPrice: highestPrice,
                 priceSpread,
                 tradeSizing,
                 profitAnalysis,
                 estimatedROI,
                 riskFactors
             };
-
+            
         } catch (error) {
             console.error('Error analyzing arbitrage opportunity:', error);
             return {
@@ -1275,11 +478,11 @@ export class TokenFetcher {
                     maxAmount: 0,
                     recommendedAmount: 0,
                     profitable: false,
-                    reason: 'Analysis failed due to error'
+                    reason: 'Error analyzing opportunity'
                 },
                 profitAnalysis: null,
                 estimatedROI: 0,
-                riskFactors: ['Technical analysis error']
+                riskFactors: ['Error during analysis']
             };
         }
     }

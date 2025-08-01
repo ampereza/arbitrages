@@ -1,4 +1,4 @@
-import { ArbitrageBot } from './arbitrage-bot.js';
+import { ArbitrageBot } from './ArbitrageBot';
 
 async function main() {
   const bot = new ArbitrageBot();

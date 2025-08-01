@@ -66,21 +66,9 @@ async function analyzeOpportunity(req: Request<{}, {}, { baseToken: Token, quote
         }
 
         const { baseToken, quoteToken } = req.body;
-        const { isTokenSupported } = await import('./constants/supported-tokens');
-        
         if (!baseToken?.symbol || !baseToken?.address || !baseToken?.decimals ||
             !quoteToken?.symbol || !quoteToken?.address || !quoteToken?.decimals) {
             res.status(400).json({ success: false, error: 'Invalid token data provided' });
-            return;
-        }
-
-        // Check if at least one token is supported for flash loans
-        const { hasSupportedTokenInPair } = await import('./constants/supported-tokens');
-        if (!hasSupportedTokenInPair(baseToken.symbol, quoteToken.symbol)) {
-            res.status(400).json({ 
-                success: false, 
-                error: 'At least one token in the pair must be supported by Aave for flash loans (WETH, USDC, USDC.e, DAI, USDT, or WBTC)' 
-            });
             return;
         }
 
