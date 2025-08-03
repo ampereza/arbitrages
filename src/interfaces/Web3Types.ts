@@ -1,25 +1,21 @@
-export type NetworkType = {
-    currentProvider: {
-        host: string;
-    }
-    eth: {
-        Contract: new (abi: any, address: string) => any;
-        getGasPrice(): Promise<string>;
-        estimateGas(txParams: any): Promise<number>;
-        getBlockNumber(): Promise<number>;
-        getBlock(blockNumber: number): Promise<{
-            baseFeePerGas: string;
-            [key: string]: any;
-        }>;
-        abi: {
-            encodeFunctionCall(params: {
-                name: string;
-                type: string;
-                inputs: Array<{
-                    type: string;
-                    name: string;
-                }>;
-            }, args: any[]): string;
+import Web3 from 'web3';
+import { Contract } from 'web3-eth-contract';
+
+export type NetworkType = 'arbitrum' | 'mainnet';
+
+export type Web3Instance = Web3;
+
+export interface Web3Contract extends Contract {
+    methods: {
+        [key: string]: (...args: any[]) => {
+            call: (options?: any) => Promise<any>;
+            send: (options?: any) => Promise<any>;
+            encodeABI: () => string;
         };
-    }
-};
+    };
+    events: {
+        [key: string]: {
+            (options?: any, cb?: Function): any;
+        };
+    };
+}

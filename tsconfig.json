@@ -22,5 +22,5 @@
     "transpileOnly": true
   },
   "include": ["src/**/*"],
-  "exclude": ["node_modules", "dist", "src/frontend/**/*"]
+  "exclude": ["node_modules", "dist"]
 } 

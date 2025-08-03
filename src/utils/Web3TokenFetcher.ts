@@ -4,6 +4,7 @@ import { AbiItem } from 'web3-utils';
 import { ERC20_ABI, FACTORY_V2_ABI, V3_FACTORY_ABI, POOL_ABI } from '../constants/abis';
 import { DEX_ADDRESSES } from '../constants/addresses';
 import { TokenInfo, PairInfo, TokenFetcherConfig } from '../interfaces/TokenFetcher';
+import { UNISWAP_V2_PAIR_ABI } from '../constants/abis';
 
 const QUOTER_ABI = [
   {
@@ -36,21 +37,49 @@ export class Web3TokenFetcher {
   private debug: boolean;
   private consecutiveFailures: number = 0;
   private maxConsecutiveFailures: number = 5;
+  private providerUrl: string;
+  private config: TokenFetcherConfig;
   
-  constructor(providerUrl: string, config: TokenFetcherConfig = {}) {
-    const provider = new Web3.providers.HttpProvider(providerUrl, {
+  constructor(providerUrl: string, config: Partial<TokenFetcherConfig> = {}) {
+    this.providerUrl = providerUrl;
+    
+    // Required fields with defaults from DEX_ADDRESSES
+    const network = config.network || 'arbitrum';
+    const dexAddresses = DEX_ADDRESSES[network];
+    
+    this.config = {
+      factoryAddress: config.factoryAddress || dexAddresses.UNISWAP_V2_FACTORY,
+      baseTokens: config.baseTokens || [
+        dexAddresses.WETH,
+        dexAddresses.USDC,
+        dexAddresses.USDT
+      ],
+      supportedTokens: config.supportedTokens || [
+        dexAddresses.WETH,
+        dexAddresses.USDC,
+        dexAddresses.USDT
+      ],
+      excludedTokens: config.excludedTokens || [],
+      maxRetries: config.maxRetries || 3,
+      retryDelay: config.retryDelay || 1000,
+      rateLimit: config.rateLimit || 1000,
+      network: network,
+      minLiquidityUsd: config.minLiquidityUsd || MIN_LIQUIDITY_USD,
+      debug: config.debug || false
+    };
+    
+    const provider = new Web3.providers.HttpProvider(this.providerUrl, {
       timeout: 30000,
       keepAlive: true,
-
     });
     this.web3 = new Web3(provider);
     
-    this.maxRetries = config.maxRetries || 3;
-    this.retryDelay = config.retryDelay || 1000;
-    this.rateLimit = config.rateLimit || 1000; // Increase rate limit to avoid Infura limits
-    this.network = config.network || 'arbitrum';
-    this.minLiquidityUsd = config.minLiquidityUsd || MIN_LIQUIDITY_USD;
-    this.debug = config.debug || false;
+    this.maxRetries = this.config.maxRetries!;
+    this.retryDelay = this.config.retryDelay!;
+    this.rateLimit = this.config.rateLimit!;
+    this.network = this.config.network!;
+    this.minLiquidityUsd = this.config.minLiquidityUsd!;
+    this.debug = this.config.debug!;
 
     this.log('Initializing Web3TokenFetcher...');
     
@@ -211,13 +240,16 @@ export class Web3TokenFetcher {
       ]);
       
       const result: PairInfo = {
+        pairAddress,
         token0Address,
         token1Address,
         reserve0: reserves._reserve0,
         reserve1: reserves._reserve1,
-        address: pairAddress,
-        token0Info: undefined,
-        token1Info: undefined
+        contract: new this.web3.eth.Contract(UNISWAP_V2_PAIR_ABI, pairAddress),
+        token0: await this.getTokenInfo(token0Address),
+        token1: await this.getTokenInfo(token1Address),
+        token0Info: await this.getTokenInfo(token0Address),
+        token1Info: await this.getTokenInfo(token1Address)
       };
       
       // Pre-fetch token info in parallel

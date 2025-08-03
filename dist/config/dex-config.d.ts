@@ -1,0 +1,93 @@
+export declare const ARBITRUM_DEX_CONFIG: {
+    dexes: ({
+        name: string;
+        enabled: boolean;
+        priority: number;
+        factory: string;
+        quoter: string;
+        router: string;
+        fees: number[];
+        gasEstimate: number;
+        description: string;
+        vault?: undefined;
+        queries?: undefined;
+        pool?: undefined;
+        registry?: undefined;
+        addressProvider?: undefined;
+    } | {
+        name: string;
+        enabled: boolean;
+        priority: number;
+        factory: string;
+        router: string;
+        gasEstimate: number;
+        description: string;
+        quoter?: undefined;
+        fees?: undefined;
+        vault?: undefined;
+        queries?: undefined;
+        pool?: undefined;
+        registry?: undefined;
+        addressProvider?: undefined;
+    } | {
+        name: string;
+        enabled: boolean;
+        priority: number;
+        vault: string;
+        queries: string;
+        gasEstimate: number;
+        description: string;
+        factory?: undefined;
+        quoter?: undefined;
+        router?: undefined;
+        fees?: undefined;
+        pool?: undefined;
+        registry?: undefined;
+        addressProvider?: undefined;
+    } | {
+        name: string;
+        enabled: boolean;
+        priority: number;
+        pool: string;
+        router: string;
+        gasEstimate: number;
+        description: string;
+        factory?: undefined;
+        quoter?: undefined;
+        fees?: undefined;
+        vault?: undefined;
+        queries?: undefined;
+        registry?: undefined;
+        addressProvider?: undefined;
+    } | {
+        name: string;
+        enabled: boolean;
+        priority: number;
+        registry: string;
+        addressProvider: string;
+        pool: string;
+        gasEstimate: number;
+        description: string;
+        factory?: undefined;
+        quoter?: undefined;
+        router?: undefined;
+        fees?: undefined;
+        vault?: undefined;
+        queries?: undefined;
+    })[];
+    priorityPairs: {
+        token0: string;
+        token1: string;
+    }[];
+    arbitrageSettings: {
+        minProfitPercent: number;
+        maxSlippage: number;
+        minLiquidity: number;
+        maxGasPrice: number;
+        scanInterval: number;
+        maxTradeSize: string;
+        minTradeSize: string;
+    };
+};
+export type DexConfig = typeof ARBITRUM_DEX_CONFIG.dexes[0];
+export type ArbitrageSettings = typeof ARBITRUM_DEX_CONFIG.arbitrageSettings;

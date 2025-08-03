@@ -5,32 +5,37 @@ import { TokenFetcher } from './TokenFetcher';
 import { Token } from './interfaces/GraphTypes';
 import { NetworkType } from './interfaces/Web3Types';
 import { ArbitrageOpportunity, DexConfig, PriceQuote } from './interfaces/ArbitrageTypes';
-import { FlashLoanExecutor } from './flash/FlashLoanExecutor';
 import { DexPriceFetcher } from './dex/DexPriceFetcher';
+import { ProfitCalculator, ProfitAnalysisDetailed } from './profit/ProfitCalculator';
+import { ARBITRUM_DEX_CONFIG } from './config/dex-config';
 
 // Load environment variables
 dotenv.config();
 
 export class ArbitrageBot {
-    private web3: NetworkType;
+    private web3: Web3;
     private tokenFetcher: TokenFetcher;
     private dexPriceFetcher: DexPriceFetcher;
-    private flashLoanExecutor: FlashLoanExecutor;
+    private profitCalculator: ProfitCalculator;
     private isRunning: boolean;
     private tokens: Token[];
     private lastPrices: { [key: string]: number };
     private opportunities: ArbitrageOpportunity[];
+    private marketPrices: Map<string, Map<string, number>>; // DEX -> TokenPair -> Price
+    private lastPriceUpdate: number;
     
     constructor() {
         const ARBITRUM_RPC = `https://arbitrum-mainnet.infura.io/v3/${process.env.INFURA_KEY}`;
-        this.web3 = new Web3(ARBITRUM_RPC) as unknown as NetworkType;
-        this.tokenFetcher = new TokenFetcher(this.web3);
-        this.dexPriceFetcher = new DexPriceFetcher(this.web3);
-        this.flashLoanExecutor = new FlashLoanExecutor(this.web3);
+        this.web3 = new Web3(ARBITRUM_RPC);
+        this.tokenFetcher = new TokenFetcher('arbitrum');
+        this.dexPriceFetcher = new DexPriceFetcher(ARBITRUM_RPC);
+        this.profitCalculator = new ProfitCalculator(this.web3);
         this.isRunning = false;
         this.tokens = [];
         this.lastPrices = {};
         this.opportunities = [];
+        this.marketPrices = new Map();
+        this.lastPriceUpdate = 0;
     }
 
     private static readonly API_ENDPOINTS = {
@@ -41,64 +46,90 @@ export class ArbitrageBot {
         cowswap: 'https://api.cow.fi/arbitrum'
     };
 
-    private static readonly DEX_CONFIG: { [key: string]: DexConfig } = {
-        CAMELOT: {
-            name: 'Camelot',
-            address: '0x6EcCab422D763aC031210895C81787E87B43A652',
-            fee: 0.003,
-            type: 'UniswapV2',
-            factoryAddress: '0x6EcCab422D763aC031210895C81787E87B43A652',
-            routerAddress: '0xc873fEcbd354f5A56E00E710B90EF4201db2448d',
-            estimatedGas: 150000
-        },
-        BALANCER: {
-            name: 'Balancer',
-            address: '0xBA12222222228d8Ba445958a75a0704d566BF2C8',
-            fee: 0.002,
-            type: 'Balancer',
-            estimatedGas: 200000
-        },
-        CURVE: {
-            name: 'Curve',
-            address: '0x8e9Bd30D15420bAe4B7EC0aC014B7ECeF864dd70',
-            fee: 0.0004,
-            type: 'Curve',
-            estimatedGas: 180000
-        },
-        DODO: {
-            name: 'DodoEX',
-            address: '0x6D310348d5c12009854DFCf72e0DF9027e8cb4f4',
-            fee: 0.001,
-            type: 'UniswapV2',
-            routerAddress: '0x6D310348d5c12009854DFCf72e0DF9027e8cb4f4',
-            estimatedGas: 160000
-        },
-        GMX: {
-            name: 'GMX',
-            address: '0x489ee077994B6658eAfA855C308275EAd8097C4A',
-            fee: 0.0003,
-            type: 'GMX',
-            estimatedGas: 250000
-        },
-        TRADERJOE: {
-            name: 'TraderJoe',
-            address: '0xb4315e873dBcf96Ffd0acd8EA43f689D8c20fB30',
-            fee: 0.003,
-            type: 'TraderJoe',
-            factoryAddress: '0x8e42f2F4101563bF679975178e880FD87d3eFd4e',
-            routerAddress: '0xb4315e873dBcf96Ffd0acd8EA43f689D8c20fB30',
-            estimatedGas: 160000
-        },
-        KYBERSWAP: {
-            name: 'KyberSwap',
-            address: '0x6131B5fae19EA4f9D964eAc0408E4408b66337b5',
-            fee: 0.003,
-            type: 'UniswapV2',
-            factoryAddress: '0x6131B5fae19EA4f9D964eAc0408E4408b66337b5',
-            routerAddress: '0x6131B5fae19EA4f9D964eAc0408E4408b66337b5',
-            estimatedGas: 170000
-        }
-    };
+    private static readonly DEX_CONFIG: { [key: string]: DexConfig } = (() => {
+        const config: { [key: string]: DexConfig } = {};
+        
+        // Convert new DEX config format to old format for compatibility
+        ARBITRUM_DEX_CONFIG.dexes.forEach(dex => {
+            // Skip disabled DEXes
+            if (!dex.enabled) {
+                return;
+            }
+            
+            const dexKey = dex.name.toUpperCase().replace(/\s/g, '').replace('V2', '').replace('V3', '');
+            
+            if (dex.name === 'UniswapV3') {
+                config['UNISWAPV3'] = {
+                    name: dex.name,
+                    address: dex.factory!,
+                    fee: 0.003,
+                    type: 'UniswapV3',
+                    factoryAddress: dex.factory!,
+                    quoterAddress: dex.quoter!,
+                    routerAddress: dex.router!,
+                    networkType: 'arbitrum' as NetworkType,
+                    priority: dex.priority,
+                    estimatedGas: dex.gasEstimate
+                };
+            } else if (dex.name === 'SushiSwap') {
+                config['SUSHISWAP'] = {
+                    name: dex.name,
+                    address: dex.factory!,
+                    fee: 0.003,
+                    type: 'UniswapV2',
+                    factoryAddress: dex.factory!,
+                    routerAddress: dex.router!,
+                    networkType: 'arbitrum' as NetworkType,
+                    priority: dex.priority,
+                    estimatedGas: dex.gasEstimate
+                };
+            } else if (dex.name === 'BalancerV2') {
+                config['BALANCER'] = {
+                    name: dex.name,
+                    address: dex.vault!,
+                    fee: 0.002,
+                    type: 'Balancer',
+                    networkType: 'arbitrum' as NetworkType,
+                    priority: dex.priority,
+                    estimatedGas: dex.gasEstimate
+                };
+            } else if (dex.name === 'Arbswap') {
+                config['ARBSWAP'] = {
+                    name: dex.name,
+                    address: dex.factory!,
+                    fee: 0.003,
+                    type: 'UniswapV2',
+                    factoryAddress: dex.factory!,
+                    routerAddress: dex.router!,
+                    networkType: 'arbitrum' as NetworkType,
+                    priority: dex.priority,
+                    estimatedGas: dex.gasEstimate
+                };
+            } else if (dex.name === 'WombatExchange') {
+                config['WOMBAT'] = {
+                    name: dex.name,
+                    address: dex.pool!,
+                    fee: 0.001,
+                    type: 'Wombat',
+                    networkType: 'arbitrum' as NetworkType,
+                    priority: dex.priority,
+                    estimatedGas: dex.gasEstimate
+                };
+            } else if (dex.name === 'CurveFinance') {
+                config['CURVE'] = {
+                    name: dex.name,
+                    address: dex.registry!,
+                    fee: 0.0004,
+                    type: 'Curve',
+                    networkType: 'arbitrum' as NetworkType,
+                    priority: dex.priority,
+                    estimatedGas: dex.gasEstimate
+                };
+            }
+        });
+        
+        return config;
+    })();
 
     private async initializeWeb3(): Promise<void> {
         try {
@@ -111,8 +142,20 @@ export class ArbitrageBot {
     }
 
     private async getBalancerPoolId(tokenIn: Token, tokenOut: Token): Promise<string> {
-        // Implementation for getting Balancer pool ID
-        return 'pool-id'; // TODO: Implement proper pool lookup
+        // Use a known WETH/USDC pool on Arbitrum Balancer V2
+        // This is the 80/20 WETH/USDC pool on Arbitrum
+        const poolIds: { [key: string]: string } = {
+            'WETH-USDC': '0x64541216bafffeec8ea535bb71fbc927831d0595000200000000000000000002',
+            'WETH-USDC.e': '0x64541216bafffeec8ea535bb71fbc927831d0595000200000000000000000002'
+        };
+        
+        // Create a key from token symbols
+        const key1 = `${tokenIn.symbol}-${tokenOut.symbol}`;
+        const key2 = `${tokenOut.symbol}-${tokenIn.symbol}`;
+        
+        const poolId = poolIds[key1] || poolIds[key2] || '0x64541216bafffeec8ea535bb71fbc927831d0595000200000000000000000002';
+        
+        return poolId;
     }
 
     private async getPriceQuote(dex: string, tokenIn: Token, tokenOut: Token, amount: string): Promise<PriceQuote> {
@@ -122,8 +165,24 @@ export class ArbitrageBot {
         try {
             switch (config.type) {
                 case 'UniswapV2':
-                    return await this.dexPriceFetcher.getUniswapV2Price(
-                        config.factoryAddress!,
+                    if (dex === 'ARBSWAP') {
+                        return await this.dexPriceFetcher.getArbswapPrice(
+                            config.factoryAddress!,
+                            tokenIn,
+                            tokenOut,
+                            amount
+                        );
+                    } else {
+                        return await this.dexPriceFetcher.getUniswapV2Price(
+                            config.factoryAddress!,
+                            tokenIn,
+                            tokenOut,
+                            amount
+                        );
+                    }
+                case 'UniswapV3':
+                    return await this.dexPriceFetcher.getUniswapV3Price(
+                        config.quoterAddress!,
                         tokenIn,
                         tokenOut,
                         amount
@@ -139,6 +198,13 @@ export class ArbitrageBot {
                     const poolId = await this.getBalancerPoolId(tokenIn, tokenOut);
                     return await this.dexPriceFetcher.getBalancerPrice(
                         poolId,
+                        config.address,
+                        tokenIn,
+                        tokenOut,
+                        amount
+                    );
+                case 'Wombat':
+                    return await this.dexPriceFetcher.getWombatPrice(
                         config.address,
                         tokenIn,
                         tokenOut,
@@ -165,6 +231,207 @@ export class ArbitrageBot {
             console.error(`Error getting price from ${dex}:`, error);
             throw error;
         }
+    }
+
+    // New method: Fetch all market prices from all DEXes for all token pairs
+    private async fetchAllMarketPrices(): Promise<void> {
+        console.log('📊 Fetching current market prices from all DEXes...');
+        
+        // Start with working DEXes and known good pairs
+        const enabledDexes = ['SUSHISWAP', 'UNISWAPV3']; // Test both
+        
+        // Start with major pairs that definitely exist
+        const majorPairs = [
+            { base: 'WETH', quote: 'USDC' },
+            { base: 'WETH', quote: 'USDT' },
+            { base: 'USDC', quote: 'USDT' },
+            { base: 'WETH', quote: 'ARB' }
+        ];
+        
+        const testAmount = '1000000'; // 1 token with 6 decimals
+        
+        this.marketPrices.clear();
+        
+        for (const dexName of enabledDexes) {
+            const dexPrices = new Map<string, number>();
+            console.log(`\n🔄 Scanning ${dexName} for prices...`);
+            
+            for (const pair of majorPairs) {
+                const baseTokenData = this.tokens.find(t => t.symbol === pair.base);
+                const quoteTokenData = this.tokens.find(t => t.symbol === pair.quote);
+                
+                if (!baseTokenData || !quoteTokenData) {
+                    console.log(`   ⚠️  Missing token data for ${pair.base}/${pair.quote}`);
+                    continue;
+                }
+                
+                const pairKey = `${pair.base}-${pair.quote}`;
+                
+                try {
+                    // Adjust test amount based on token decimals
+                    const adjustedAmount = baseTokenData.decimals === 18 
+                        ? '1000000000000000000' // 1 token with 18 decimals
+                        : '1000000'; // 1 token with 6 decimals
+                    
+                    // Get price for base -> quote
+                    const priceQuote = await this.getPriceQuote(dexName, baseTokenData, quoteTokenData, adjustedAmount);
+                    const price = parseFloat(priceQuote.price);
+                    
+                    if (price > 0) {
+                        dexPrices.set(pairKey, price);
+                        console.log(`   ✅ ${dexName}: ${pairKey} = ${price.toFixed(6)}`);
+                    } else {
+                        console.log(`   ❌ ${dexName}: ${pairKey} = 0 (no liquidity)`);
+                    }
+                    
+                } catch (error) {
+                    const errorMsg = error instanceof Error ? error.message : 'Unknown error';
+                    console.log(`   ❌ ${dexName}: ${pairKey} - ${errorMsg}`);
+                    continue;
+                }
+                
+                // Small delay to avoid overwhelming the node
+                await new Promise(resolve => setTimeout(resolve, 200));
+            }
+            
+            this.marketPrices.set(dexName, dexPrices);
+            console.log(`📊 ${dexName}: Successfully fetched ${dexPrices.size} price pairs`);
+        }
+        
+        this.lastPriceUpdate = Date.now();
+        console.log(`\n🎯 Price fetching completed. Next: Analyze for arbitrage opportunities...`);
+    }
+
+    // New method: Find arbitrage opportunities using cached prices with detailed profit analysis
+    private async findArbitrageOpportunities(): Promise<ArbitrageOpportunity[]> {
+        const opportunities: ArbitrageOpportunity[] = [];
+        const dexNames = Array.from(this.marketPrices.keys());
+        
+        if (dexNames.length < 2) {
+            console.log('⚠️  Need at least 2 DEXes with prices to find arbitrage');
+            return opportunities;
+        }
+        
+        console.log('🔍 Analyzing price differences for arbitrage opportunities...');
+        
+        for (let i = 0; i < dexNames.length; i++) {
+            for (let j = i + 1; j < dexNames.length; j++) {
+                const dex1 = dexNames[i];
+                const dex2 = dexNames[j];
+                const prices1 = this.marketPrices.get(dex1)!;
+                const prices2 = this.marketPrices.get(dex2)!;
+                
+                // Find common trading pairs
+                for (const [pairKey, price1] of prices1) {
+                    const price2 = prices2.get(pairKey);
+                    if (!price2) continue;
+                    
+                    // Calculate price difference percentage
+                    const priceDiff = Math.abs(price1 - price2);
+                    const avgPrice = (price1 + price2) / 2;
+                    const diffPercentage = (priceDiff / avgPrice) * 100;
+                    
+                    // Only consider significant price differences (>0.1%)
+                    if (diffPercentage > 0.1) {
+                        const [baseSymbol, tokenSymbol] = pairKey.split('-');
+                        const buyDex = price1 < price2 ? dex1 : dex2;
+                        const sellDex = price1 < price2 ? dex2 : dex1;
+                        const buyPrice = Math.min(price1, price2);
+                        const sellPrice = Math.max(price1, price2);
+                        
+                        const tokenIn = this.tokens.find(t => t.symbol === baseSymbol)!;
+                        const tokenOut = this.tokens.find(t => t.symbol === tokenSymbol)!;
+                        
+                        // Create basic opportunity object
+                        const basicOpportunity: ArbitrageOpportunity = {
+                            buyDEX: buyDex,
+                            sellDEX: sellDex,
+                            buyPrice,
+                            sellPrice,
+                            priceSpread: diffPercentage,
+                            estimatedROI: diffPercentage - 0.5, // Rough estimate minus fees
+                            profitAnalysis: {
+                                netProfit: (sellPrice - buyPrice) * 1000, // Placeholder
+                                grossProfit: (sellPrice - buyPrice) * 1000,
+                                gasCost: 50 // Placeholder
+                            },
+                            tradeSizing: {
+                                recommendedAmount: 1000,
+                                maxAmount: 5000,
+                                minAmount: 100
+                            },
+                            riskFactors: [],
+                            tokenIn,
+                            tokenOut,
+                            timestamp: Date.now()
+                        };
+                        
+                        // Perform detailed profit analysis
+                        try {
+                            const detailedAnalysis = await this.profitCalculator.calculateDetailedProfit(
+                                basicOpportunity,
+                                1000, // Default $1000 trade size
+                                {
+                                    slippageTolerance: 0.005, // 0.5%
+                                    useFlashLoan: true,
+                                    mevProtection: false
+                                }
+                            );
+                            
+                            // Only add opportunities that are profitable after all costs
+                            if (detailedAnalysis.netProfit > 0 && detailedAnalysis.safetyMargin > 0) {
+                                // Update opportunity with detailed analysis
+                                basicOpportunity.profitAnalysis = {
+                                    netProfit: detailedAnalysis.netProfit,
+                                    grossProfit: detailedAnalysis.grossRevenue,
+                                    gasCost: detailedAnalysis.costs.totalGasCostUSD
+                                };
+                                
+                                basicOpportunity.tradeSizing = {
+                                    recommendedAmount: detailedAnalysis.optimalTradeSize,
+                                    maxAmount: detailedAnalysis.maxTradeSize,
+                                    minAmount: detailedAnalysis.minProfitableSize
+                                };
+                                
+                                basicOpportunity.estimatedROI = detailedAnalysis.roi;
+                                
+                                // Add risk factors based on analysis
+                                if (detailedAnalysis.safetyMargin < 1) {
+                                    basicOpportunity.riskFactors.push('Low safety margin');
+                                }
+                                if (detailedAnalysis.priceImpact > 0.02) {
+                                    basicOpportunity.riskFactors.push('High price impact');
+                                }
+                                if (detailedAnalysis.liquidityRisk > 0.5) {
+                                    basicOpportunity.riskFactors.push('Liquidity risk');
+                                }
+                                if (detailedAnalysis.executionWindow < 60) {
+                                    basicOpportunity.riskFactors.push('Short execution window');
+                                }
+                                
+                                opportunities.push(basicOpportunity);
+                                
+                                console.log(`💰 PROFITABLE ARBITRAGE: ${pairKey}`);
+                                console.log(`   Buy: ${buyDex} ($${buyPrice.toFixed(6)}) | Sell: ${sellDex} ($${sellPrice.toFixed(6)})`);
+                                console.log(`   Spread: ${diffPercentage.toFixed(2)}% | Net Profit: $${detailedAnalysis.netProfit.toFixed(2)}`);
+                                console.log(`   Break-even: ${detailedAnalysis.breakEvenSpread.toFixed(2)}% | Safety: ${detailedAnalysis.safetyMargin.toFixed(2)}%`);
+                                console.log(`   Optimal Size: $${detailedAnalysis.optimalTradeSize.toLocaleString()}`);
+                                console.log(`   Gas Cost: $${detailedAnalysis.costs.totalGasCostUSD.toFixed(2)} | Total Costs: $${detailedAnalysis.costs.totalCosts.toFixed(2)}`);
+                            } else {
+                                console.log(`❌ UNPROFITABLE: ${pairKey} | Spread: ${diffPercentage.toFixed(2)}% | Net: $${detailedAnalysis.netProfit.toFixed(2)} | Break-even: ${detailedAnalysis.breakEvenSpread.toFixed(2)}%`);
+                            }
+                            
+                        } catch (error) {
+                            console.error(`Error analyzing profit for ${pairKey}:`, error);
+                            // Fall back to basic opportunity without detailed analysis
+                            console.log(`💰 BASIC ARBITRAGE: ${pairKey} | Buy: ${buyDex} (${buyPrice.toFixed(6)}) | Sell: ${sellDex} (${sellPrice.toFixed(6)}) | Spread: ${diffPercentage.toFixed(2)}%`);
+                        }
+                    }
+                }
+            }
+        }
+        
+        return opportunities.sort((a, b) => (b.profitAnalysis.netProfit - a.profitAnalysis.netProfit)); // Sort by highest net profit first
     }
 
     private async scanArbitrageOpportunities(baseToken: Token, options: {
@@ -194,54 +461,50 @@ export class ArbitrageBot {
                         if (buyDex === sellDex) continue;
 
                         try {
-                            // Get flash loan quote first
-                            const flashLoanQuote = await this.flashLoanExecutor.getFlashLoanQuote(
-                                baseToken,
-                                '1000000000000000000' // Start with 1 token
-                            );
+                            // Use a standard test amount (1 token) for price comparison
+                            const testAmount = '1000000000000000000'; // 1 token in wei
 
-                            // Calculate optimal amount considering flash loan fees
-                            const optimalAmount = await this.calculateOptimalTradeSize(
-                                buyDex,
-                                sellDex,
-                                baseToken,
-                                token,
-                                flashLoanQuote.premium,
-                                maxSlippage
-                            );
-
-                            // Get quotes for the optimal amount
-                            const buyQuote = await this.getPriceQuote(buyDex, baseToken, token, optimalAmount);
-                            const sellQuote = await this.getPriceQuote(sellDex, token, baseToken, buyQuote.price);
+                            // Get quotes for the test amount
+                            const buyQuote = await this.getPriceQuote(buyDex, baseToken, token, testAmount);
+                            
+                            // Convert the exchange rate to an amount in wei for the sell quote
+                            // buyQuote.price is the exchange rate, multiply by testAmount to get output amount
+                            const outputAmount = Math.floor(parseFloat(buyQuote.price) * parseFloat(testAmount)).toString();
+                            const sellQuote = await this.getPriceQuote(sellDex, token, baseToken, outputAmount);
 
                             const buyPrice = parseFloat(buyQuote.price);
                             const sellPrice = parseFloat(sellQuote.price);
                             
+                            console.log(`📈 ${baseToken.symbol}→${token.symbol}: ${buyDex} buy=${buyPrice.toFixed(6)}, ${sellDex} sell=${sellPrice.toFixed(6)}`);
+                            
                             if (sellPrice > buyPrice) {
-                                // Calculate all costs
-                                const gasPrice = await this.web3.eth.getGasPrice();
-                                const totalGas = buyQuote.gas + sellQuote.gas + flashLoanQuote.estimatedGas;
-                                const gasCost = totalGas * parseFloat(gasPrice);
-                                const flashLoanCost = parseFloat(optimalAmount) * (flashLoanQuote.premium / 100);
-                                const totalCost = gasCost + flashLoanCost;
-
-                                // Calculate profit after all costs
+                                // Calculate simple profit percentage without flash loan costs
                                 const grossProfit = sellPrice - buyPrice;
-                                const netProfit = grossProfit - totalCost;
-                                const profitPercent = (netProfit / buyPrice) * 100;
+                                const profitPercent = (grossProfit / buyPrice) * 100;
 
-                                // Check if profitable after all costs
-                                if (profitPercent > minProfitPercent && netProfit > 0) {
+                                // Check if profitable (use a lower threshold since we removed flash loan costs)
+                                if (profitPercent > minProfitPercent && grossProfit > 0) {
                                     this.opportunities.push({
-                                        fromDex: buyDex,
-                                        toDex: sellDex,
+                                        buyDEX: buyDex,
+                                        sellDEX: sellDex,
                                         tokenIn: baseToken,
                                         tokenOut: token,
-                                        amountIn: optimalAmount,
-                                        expectedProfit: grossProfit,
-                                        profitPercent,
-                                        gasCost,
-                                        netProfit
+                                        profitAnalysis: {
+                                            netProfit: grossProfit, // Simplified without fees
+                                            grossProfit,
+                                            gasCost: 0 // Will calculate later when executing
+                                        },
+                                        tradeSizing: {
+                                            recommendedAmount: parseFloat(testAmount),
+                                            maxAmount: parseFloat(testAmount) * 10,
+                                            minAmount: parseFloat(testAmount) * 0.1
+                                        },
+                                        priceSpread: profitPercent,
+                                        estimatedROI: grossProfit / parseFloat(testAmount),
+                                        buyPrice: parseFloat(buyPrice.toString()),
+                                        sellPrice: parseFloat(sellPrice.toString()),
+                                        timestamp: Date.now(),
+                                        riskFactors: []
                                     });
                                 }
                             }
@@ -279,7 +542,10 @@ export class ArbitrageBot {
             try {
                 // Get quotes for this amount
                 const buyQuote = await this.getPriceQuote(buyDex, tokenIn, tokenOut, amount);
-                const sellQuote = await this.getPriceQuote(sellDex, tokenOut, tokenIn, buyQuote.price);
+                
+                // Convert the exchange rate to an amount in wei for the sell quote
+                const outputAmount = Math.floor(parseFloat(buyQuote.price) * parseFloat(amount)).toString();
+                const sellQuote = await this.getPriceQuote(sellDex, tokenOut, tokenIn, outputAmount);
 
                 // Calculate costs
                 const flashLoanFee = parseFloat(amount) * (flashLoanPremium / 100);
@@ -315,7 +581,7 @@ export class ArbitrageBot {
         this.isRunning = true;
 
         const {
-            minLiquidity = 10000,
+            minLiquidity = 0.5, // Use liquidity score (0-1.0) instead of USD amount
             maxGasPrice = 100,
             scanInterval = 10000
         } = options;
@@ -327,15 +593,31 @@ export class ArbitrageBot {
             while (this.isRunning) {
                 const gasPrice = await this.web3.eth.getGasPrice();
                 if (Number(Web3.utils.fromWei(gasPrice, 'gwei')) > maxGasPrice) {
-                    console.log('Gas price too high, skipping scan');
+                    console.log('⛽ Gas price too high, skipping scan');
                     await new Promise(resolve => setTimeout(resolve, scanInterval));
                     continue;
                 }
 
-                for (const token of this.tokens) {
-                    await this.scanArbitrageOpportunities(token, options);
+                // STEP 1: Fetch all current market prices first
+                await this.fetchAllMarketPrices();
+                
+                // STEP 2: Find arbitrage opportunities using the cached prices
+                const opportunities = await this.findArbitrageOpportunities();
+                
+                // STEP 3: Display results with detailed profit analysis
+                if (opportunities.length > 0) {
+                    console.log(`\n🎯 Found ${opportunities.length} PROFITABLE arbitrage opportunities:`);
+                    opportunities.slice(0, 5).forEach((opp, i) => {
+                        const riskInfo = opp.riskFactors.length > 0 ? ` ⚠️ ${opp.riskFactors.join(', ')}` : '';
+                        console.log(`   ${i + 1}. ${opp.tokenIn.symbol}→${opp.tokenOut.symbol}: $${opp.buyPrice.toFixed(2)} → $${opp.sellPrice.toFixed(2)}`);
+                        console.log(`      💰 Net Profit: $${opp.profitAnalysis.netProfit.toFixed(2)} | ROI: ${(opp.estimatedROI * 100).toFixed(2)}%`);
+                        console.log(`      📊 ${opp.buyDEX} → ${opp.sellDEX} | Size: $${opp.tradeSizing.recommendedAmount.toLocaleString()}${riskInfo}`);
+                    });
+                } else {
+                    console.log('📊 No profitable arbitrage opportunities found this scan (after costs)');
                 }
 
+                // Wait before next scan
                 await new Promise(resolve => setTimeout(resolve, scanInterval));
             }
         } catch (error) {
@@ -354,48 +636,58 @@ export class ArbitrageBot {
     }
 
     public async executeArbitrage(opportunity: ArbitrageOpportunity): Promise<boolean> {
+        // TODO: Implement direct arbitrage execution (without flash loans) 
+        // This will be implemented when integrating your smart contract
+        console.log('💡 Found arbitrage opportunity (execution disabled for now):', {
+            buyDEX: opportunity.buyDEX,
+            sellDEX: opportunity.sellDEX,
+            profitPercent: opportunity.priceSpread.toFixed(3) + '%',
+            tokenPair: `${opportunity.tokenIn.symbol}/${opportunity.tokenOut.symbol}`,
+            buyPrice: opportunity.buyPrice,
+            sellPrice: opportunity.sellPrice
+        });
+        return false;
+    }
+
+    /**
+     * Get detailed profit analysis for a specific opportunity
+     */
+    public async getDetailedProfitAnalysis(
+        opportunity: ArbitrageOpportunity, 
+        tradeAmountUSD: number = 1000
+    ): Promise<string> {
         try {
-            // Get flash loan parameters
-            const buyDex = ArbitrageBot.DEX_CONFIG[opportunity.fromDex];
-            const sellDex = ArbitrageBot.DEX_CONFIG[opportunity.toDex];
-
-            if (!buyDex || !sellDex) {
-                throw new Error('Invalid DEX configuration');
-            }
-
-            // Prepare transaction data for flash loan
-            const buyData = this.encodeBuyTransaction(buyDex, opportunity);
-            const sellData = this.encodeSellTransaction(sellDex, opportunity);
-
-            // Execute flash loan
-            const result = await this.flashLoanExecutor.executeFlashLoan({
-                token: opportunity.tokenIn,
-                amount: opportunity.amountIn,
-                targets: [buyDex.address, sellDex.address],
-                data: [buyData, sellData]
-            });
-
-            if (!result.success) {
-                console.error('Flash loan execution failed:', result.error);
-                return false;
-            }
-
-            // Verify profit
-            if (parseFloat(result.profitOrLoss) <= 0) {
-                console.error('Arbitrage resulted in loss:', result.profitOrLoss);
-                return false;
-            }
-
-            console.log('Arbitrage executed successfully:', {
-                profit: result.profitOrLoss,
-                gasCost: result.gasCost
-            });
-
-            return true;
-
+            const analysis = await this.profitCalculator.calculateDetailedProfit(
+                opportunity,
+                tradeAmountUSD,
+                {
+                    slippageTolerance: 0.005,
+                    useFlashLoan: true,
+                    mevProtection: false
+                }
+            );
+            
+            return this.profitCalculator.formatProfitAnalysis(analysis);
         } catch (error) {
-            console.error('Error executing arbitrage:', error);
-            return false;
+            return `Error calculating detailed profit analysis: ${error}`;
+        }
+    }
+
+    /**
+     * Quick profit screening for multiple opportunities
+     */
+    public async screenOpportunities(opportunities: ArbitrageOpportunity[]): Promise<void> {
+        console.log('\n🔍 PROFIT SCREENING RESULTS:');
+        console.log('='.repeat(80));
+        
+        for (const opp of opportunities.slice(0, 10)) {
+            const quick = await this.profitCalculator.quickProfitCheck(opp, 1000);
+            const status = quick.isProfit ? '✅ PROFITABLE' : '❌ UNPROFITABLE';
+            const spread = opp.priceSpread.toFixed(2);
+            const breakeven = quick.breakEvenSpread.toFixed(2);
+            const profit = quick.netProfitUSD.toFixed(2);
+            
+            console.log(`${status} | ${opp.tokenIn.symbol}-${opp.tokenOut.symbol} | Spread: ${spread}% | Break-even: ${breakeven}% | Net: $${profit}`);
         }
     }
 
@@ -404,35 +696,35 @@ export class ArbitrageBot {
             case 'UniswapV2':
                 return this.encodeUniswapV2Swap(
                     dex.routerAddress!,
-                    opportunity.amountIn,
+                    opportunity.tradeSizing.recommendedAmount.toString(),
                     opportunity.tokenIn.address,
                     opportunity.tokenOut.address
                 );
             case 'Curve':
                 return this.encodeCurveSwap(
                     dex.address,
-                    opportunity.amountIn,
+                    opportunity.tradeSizing.recommendedAmount.toString(),
                     opportunity.tokenIn.address,
                     opportunity.tokenOut.address
                 );
             case 'Balancer':
                 return this.encodeBalancerSwap(
                     dex.address,
-                    opportunity.amountIn,
+                    opportunity.tradeSizing.recommendedAmount.toString(),
                     opportunity.tokenIn.address,
                     opportunity.tokenOut.address
                 );
             case 'GMX':
                 return this.encodeGMXSwap(
                     dex.address,
-                    opportunity.amountIn,
+                    opportunity.tradeSizing.recommendedAmount.toString(),
                     opportunity.tokenIn.address,
                     opportunity.tokenOut.address
                 );
             case 'TraderJoe':
                 return this.encodeTraderJoeSwap(
                     dex.routerAddress!,
-                    opportunity.amountIn,
+                    opportunity.tradeSizing.recommendedAmount.toString(),
                     opportunity.tokenIn.address,
                     opportunity.tokenOut.address
                 );
@@ -474,7 +766,7 @@ export class ArbitrageBot {
             amountIn,
             '0', // No slippage check for atomic transaction
             path,
-            this.web3.currentProvider.host,
+            (this.web3.currentProvider as any)?.host || this.web3.currentProvider?.toString() || '',
             deadline.toString()
         ]);
     }
@@ -571,7 +863,7 @@ export class ArbitrageBot {
             amountIn,
             '0', // No slippage check
             [tokenIn, tokenOut],
-            this.web3.currentProvider.host,
+            (this.web3.currentProvider as any)?.host || this.web3.currentProvider?.toString() || '',
             Math.floor(Date.now() / 1000) + 300 // 5 minutes
         ]);
     }

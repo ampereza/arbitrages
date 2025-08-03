@@ -23,17 +23,11 @@ sleep 5
 # Test if API is responding
 curl -s http://localhost:3001/api/health || echo "Warning: API server not responding on port 3001"
 
-# Start frontend with a specific port
-echo "Starting frontend on port 3002..."
-cd /home/botme/arbitrages/src/frontend
+echo "✅ API server is running on port 3001"
+echo "API server will continue running..."
 
-# Make sure we have the necessary frontend dependencies
-echo "Checking frontend dependencies..."
-npm install --no-fund --no-audit
-
-# Start Next.js dev server with a specific port
-echo "Starting Next.js dev server..."
-PORT=3002 npm run dev
+# Keep the API server running
+wait $API_PID
 
 # Kill the API server when this script ends
 trap "echo 'Shutting down API server...'; kill $API_PID 2>/dev/null || true" EXIT

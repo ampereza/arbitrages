@@ -1,4 +1,2 @@
-const nextConfig = {
-/* config options here */
-};
-export default nextConfig;
+"use strict";
+//# sourceMappingURL=next.config.js.map

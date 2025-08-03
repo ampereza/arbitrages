@@ -1,162 +1,464 @@
+import { ArbitrageOpportunity, DexConfig } from '../interfaces/ArbitrageTypes';
 import { Token } from '../interfaces/GraphTypes';
-import { ArbitrageOpportunity } from '../interfaces/ArbitrageTypes';
-import { FlashLoanExecutor } from '../flash/FlashLoanExecutor';
 import Web3 from 'web3';
-import { NetworkType } from '../interfaces/Web3Types';
 
-export interface ProfitAnalysis {
-    baseProfit: string;
-    flashLoanFee: string;
-    estimatedGasCost: string;
-    slippageImpact: string;
-    mevProtectionCost: string;
-    netProfit: string;
-    netProfitUSD: string;
-    profitableAmount: string;
-    isViable: boolean;
-    details: {
-        priceImpact: string;
-        executionPriority: number;
-        flashLoanAmount: string;
-        optimalGasPrice: string;
-        minProfit: string;
-    };
+export interface TradingCosts {
+    // Flash loan costs
+    aaveFlashLoanFee: number;  // Aave charges 0.1% (0.001)
+    
+    // Gas costs
+    gasPrice: number;          // Current gas price in Gwei
+    totalGasUsed: number;      // Total gas for all operations
+    totalGasCostETH: number;   // Total gas cost in ETH
+    totalGasCostUSD: number;   // Total gas cost in USD
+    
+    // DEX trading fees
+    buyDexFee: number;         // Fee percentage for buy DEX
+    sellDexFee: number;        // Fee percentage for sell DEX
+    buyDexFeeAmount: number;   // Actual fee amount for buy
+    sellDexFeeAmount: number;  // Actual fee amount for sell
+    
+    // Slippage costs
+    buySlippage: number;       // Expected slippage on buy
+    sellSlippage: number;      // Expected slippage on sell
+    totalSlippageCost: number; // Total cost from slippage
+    
+    // MEV protection costs
+    mevProtectionFee: number;  // Optional MEV protection fee
+    
+    // Bridge costs (if applicable)
+    bridgeFees: number;        // Cross-chain bridge fees if needed
+    
+    // Total costs
+    totalCosts: number;        // Sum of all costs
+}
+
+export interface ProfitAnalysisDetailed {
+    // Revenue
+    grossRevenue: number;      // Revenue from arbitrage before costs
+    
+    // Costs breakdown
+    costs: TradingCosts;
+    
+    // Profit calculations
+    netProfit: number;         // Gross revenue - total costs
+    profitMargin: number;      // Net profit / gross revenue
+    roi: number;              // Net profit / investment amount
+    
+    // Risk metrics
+    breakEvenSpread: number;   // Minimum spread needed to break even
+    safetyMargin: number;      // How much above break-even we are
+    
+    // Trade sizing
+    optimalTradeSize: number;  // Optimal trade size for max profit
+    maxTradeSize: number;      // Max size before diminishing returns
+    minProfitableSize: number; // Minimum size to be profitable
+    
+    // Market impact
+    priceImpact: number;       // Expected price impact from trade
+    liquidityRisk: number;     // Risk of insufficient liquidity
+    
+    // Execution timing
+    executionWindow: number;   // Time window for profitable execution
+    latencyRisk: number;       // Risk from execution delays
 }
 
 export class ProfitCalculator {
     private web3: Web3;
-    private flashLoanExecutor: FlashLoanExecutor;
+    private ethPriceUSD: number = 3300; // Current ETH price estimate
     
-    // Constants for calculations
-    private readonly MEV_PROTECTION_FACTOR = 0.005; // 0.5% for MEV protection
-    private readonly MIN_PROFIT_THRESHOLD = 0.001; // 0.1% minimum profit
-    private readonly MAX_PRICE_IMPACT = 0.02; // 2% maximum price impact
-    private readonly GAS_PRICE_BUFFER = 1.2; // 20% buffer on gas price
+    // Gas estimates for different operations on Arbitrum
+    private static readonly GAS_ESTIMATES = {
+        aaveFlashLoan: 200000,      // Aave flash loan initiation
+        uniswapV2Swap: 120000,      // UniswapV2 swap
+        uniswapV3Swap: 150000,      // UniswapV3 swap
+        sushiSwap: 120000,          // SushiSwap
+        curveSwap: 200000,          // Curve swap
+        balancerSwap: 180000,       // Balancer swap
+        tokenApproval: 50000,       // Token approval
+        baseTransaction: 21000,     // Base transaction cost
+        complexArbitrage: 400000,   // Complex multi-step arbitrage
+    };
     
-    constructor(web3: NetworkType) {
-        this.web3 = web3 as any;
-        this.flashLoanExecutor = new FlashLoanExecutor(web3);
+    // DEX fee rates
+    private static readonly DEX_FEES = {
+        UNISWAPV3: 0.003,          // 0.3%
+        SUSHISWAP: 0.003,          // 0.3%
+        CURVE: 0.0004,             // 0.04%
+        BALANCER: 0.002,           // 0.2%
+        GMX: 0.001,                // 0.1%
+        TRADERJOE: 0.003,          // 0.3%
+        ARBSWAP: 0.003,            // 0.3%
+        WOMBAT: 0.001,             // 0.1%
+    };
+    
+    constructor(web3: Web3) {
+        this.web3 = web3;
     }
     
-    private async calculateSlippageImpact(
+    /**
+     * Update ETH price for accurate USD calculations
+     */
+    public updateETHPrice(priceUSD: number): void {
+        this.ethPriceUSD = priceUSD;
+    }
+    
+    /**
+     * Calculate comprehensive profit analysis including all trading costs
+     */
+    public async calculateDetailedProfit(
         opportunity: ArbitrageOpportunity,
-        amount: string
-    ): Promise<string> {
-        // Calculate slippage based on order size and liquidity
-        const amountBN = BigInt(amount);
-        const poolLiquidity = BigInt(opportunity.tokenIn.liquidity || '0');
+        tradeAmountUSD: number,
+        options: {
+            gasPrice?: number;
+            slippageTolerance?: number;
+            mevProtection?: boolean;
+            useFlashLoan?: boolean;
+        } = {}
+    ): Promise<ProfitAnalysisDetailed> {
         
-        if (poolLiquidity === BigInt(0)) return '0';
+        const {
+            gasPrice = await this.getCurrentGasPrice(),
+            slippageTolerance = 0.005, // 0.5% default slippage
+            mevProtection = false,
+            useFlashLoan = true
+        } = options;
         
-        // Impact increases exponentially with order size
-        const impact = Number((amountBN * BigInt(10000)) / poolLiquidity) / 100;
-        const slippageImpact = Math.min(
-            impact * impact, // Quadratic impact
-            Number(this.MAX_PRICE_IMPACT)
+        // Calculate trade amounts
+        const tradeAmountToken = tradeAmountUSD / opportunity.buyPrice;
+        const expectedOutput = tradeAmountToken * opportunity.sellPrice;
+        const grossRevenue = expectedOutput - tradeAmountUSD;
+        
+        // Calculate all trading costs
+        const costs = await this.calculateTradingCosts(
+            opportunity,
+            tradeAmountToken,
+            tradeAmountUSD,
+            gasPrice,
+            slippageTolerance,
+            mevProtection,
+            useFlashLoan
         );
         
-        return (slippageImpact * Number(amount)).toString();
-    }
-    
-    private async estimateOptimalGasPrice(): Promise<string> {
-        const baseGasPrice = await this.web3.eth.getGasPrice();
-        const optimalGasPrice = BigInt(baseGasPrice) * BigInt(Math.floor(this.GAS_PRICE_BUFFER * 100)) / BigInt(100);
-        return optimalGasPrice.toString();
-    }
-    
-    private calculateMEVProtection(amount: string): string {
-        return (BigInt(amount) * BigInt(Math.floor(this.MEV_PROTECTION_FACTOR * 10000)) / BigInt(10000)).toString();
-    }
-    
-    private async findOptimalTradeSize(
-        opportunity: ArbitrageOpportunity,
-        maxAmount: string
-    ): Promise<string> {
-        const steps = 10;
-        let optimalAmount = '0';
-        let maxProfit = BigInt(0);
+        // Calculate profit metrics
+        const netProfit = grossRevenue - costs.totalCosts;
+        const profitMargin = grossRevenue > 0 ? (netProfit / grossRevenue) : 0;
+        const roi = tradeAmountUSD > 0 ? (netProfit / tradeAmountUSD) : 0;
         
-        for (let i = 1; i <= steps; i++) {
-            const amount = (BigInt(maxAmount) * BigInt(i) / BigInt(steps)).toString();
-            const analysis = await this.analyzeProfitability(opportunity, amount);
-            const profit = BigInt(analysis.netProfit);
+        // Calculate risk metrics
+        const breakEvenSpread = (costs.totalCosts / tradeAmountUSD) * 100;
+        const currentSpread = opportunity.priceSpread;
+        const safetyMargin = currentSpread - breakEvenSpread;
+        
+        // Calculate optimal trade sizing
+        const tradeSizing = await this.calculateOptimalTradeSizing(
+            opportunity,
+            costs,
+            gasPrice
+        );
+        
+        // Calculate market impact and risks
+        const marketRisks = this.calculateMarketRisks(
+            opportunity,
+            tradeAmountToken,
+            currentSpread
+        );
+        
+        return {
+            grossRevenue,
+            costs,
+            netProfit,
+            profitMargin,
+            roi,
+            breakEvenSpread,
+            safetyMargin,
+            optimalTradeSize: tradeSizing.optimal,
+            maxTradeSize: tradeSizing.maximum,
+            minProfitableSize: tradeSizing.minimum,
+            priceImpact: marketRisks.priceImpact,
+            liquidityRisk: marketRisks.liquidityRisk,
+            executionWindow: marketRisks.executionWindow,
+            latencyRisk: marketRisks.latencyRisk
+        };
+    }
+    
+    /**
+     * Calculate all trading costs including gas, fees, and slippage
+     */
+    private async calculateTradingCosts(
+        opportunity: ArbitrageOpportunity,
+        tradeAmount: number,
+        tradeAmountUSD: number,
+        gasPrice: number,
+        slippageTolerance: number,
+        mevProtection: boolean,
+        useFlashLoan: boolean
+    ): Promise<TradingCosts> {
+        
+        // 1. Aave Flash Loan Fee (0.1%)
+        const aaveFlashLoanFee = useFlashLoan ? 0.001 : 0; // 0.1%
+        
+        // 2. Gas costs calculation
+        let totalGasUsed = ProfitCalculator.GAS_ESTIMATES.baseTransaction;
+        
+        if (useFlashLoan) {
+            totalGasUsed += ProfitCalculator.GAS_ESTIMATES.aaveFlashLoan;
+        }
+        
+        // Add gas for buy transaction
+        totalGasUsed += this.getGasEstimateForDex(opportunity.buyDEX);
+        
+        // Add gas for sell transaction
+        totalGasUsed += this.getGasEstimateForDex(opportunity.sellDEX);
+        
+        // Add token approvals (2 approvals typically needed)
+        totalGasUsed += ProfitCalculator.GAS_ESTIMATES.tokenApproval * 2;
+        
+        const totalGasCostETH = (totalGasUsed * gasPrice * 1e-9); // Convert Gwei to ETH
+        const totalGasCostUSD = totalGasCostETH * this.ethPriceUSD;
+        
+        // 3. DEX trading fees
+        const buyDexFee = ProfitCalculator.DEX_FEES[opportunity.buyDEX as keyof typeof ProfitCalculator.DEX_FEES] || 0.003;
+        const sellDexFee = ProfitCalculator.DEX_FEES[opportunity.sellDEX as keyof typeof ProfitCalculator.DEX_FEES] || 0.003;
+        
+        const buyDexFeeAmount = tradeAmountUSD * buyDexFee;
+        const sellDexFeeAmount = (tradeAmount * opportunity.sellPrice) * sellDexFee;
+        
+        // 4. Slippage costs
+        const buySlippage = slippageTolerance;
+        const sellSlippage = slippageTolerance;
+        const totalSlippageCost = tradeAmountUSD * (buySlippage + sellSlippage);
+        
+        // 5. MEV protection fee (if enabled)
+        const mevProtectionFee = mevProtection ? tradeAmountUSD * 0.0005 : 0; // 0.05%
+        
+        // 6. Bridge fees (usually not needed on same chain)
+        const bridgeFees = 0;
+        
+        // Calculate total costs
+        const totalCosts = 
+            (tradeAmountUSD * aaveFlashLoanFee) +  // Flash loan fee
+            totalGasCostUSD +                       // Gas costs
+            buyDexFeeAmount +                       // Buy DEX fee
+            sellDexFeeAmount +                      // Sell DEX fee
+            totalSlippageCost +                     // Slippage costs
+            mevProtectionFee +                      // MEV protection
+            bridgeFees;                             // Bridge fees
+        
+        return {
+            aaveFlashLoanFee,
+            gasPrice,
+            totalGasUsed,
+            totalGasCostETH,
+            totalGasCostUSD,
+            buyDexFee,
+            sellDexFee,
+            buyDexFeeAmount,
+            sellDexFeeAmount,
+            buySlippage,
+            sellSlippage,
+            totalSlippageCost,
+            mevProtectionFee,
+            bridgeFees,
+            totalCosts
+        };
+    }
+    
+    /**
+     * Get gas estimate for specific DEX
+     */
+    private getGasEstimateForDex(dexName: string): number {
+        switch (dexName) {
+            case 'UNISWAPV3':
+                return ProfitCalculator.GAS_ESTIMATES.uniswapV3Swap;
+            case 'SUSHISWAP':
+                return ProfitCalculator.GAS_ESTIMATES.sushiSwap;
+            case 'CURVE':
+                return ProfitCalculator.GAS_ESTIMATES.curveSwap;
+            case 'BALANCER':
+                return ProfitCalculator.GAS_ESTIMATES.balancerSwap;
+            default:
+                return ProfitCalculator.GAS_ESTIMATES.uniswapV2Swap;
+        }
+    }
+    
+    /**
+     * Calculate optimal trade sizing for maximum profit
+     */
+    private async calculateOptimalTradeSizing(
+        opportunity: ArbitrageOpportunity,
+        baseCosts: TradingCosts,
+        gasPrice: number
+    ): Promise<{ optimal: number; maximum: number; minimum: number }> {
+        
+        const testSizes = [100, 500, 1000, 2500, 5000, 10000, 25000, 50000]; // USD amounts
+        let optimalSize = 1000;
+        let maxProfit = -Infinity;
+        
+        for (const sizeUSD of testSizes) {
+            // Calculate profit for this size
+            const tradeCosts = await this.calculateTradingCosts(
+                opportunity,
+                sizeUSD / opportunity.buyPrice,
+                sizeUSD,
+                gasPrice,
+                0.005, // 0.5% slippage
+                false, // No MEV protection for sizing calc
+                true   // Use flash loan
+            );
             
-            if (profit > maxProfit) {
-                maxProfit = profit;
-                optimalAmount = amount;
+            const grossRevenue = (sizeUSD / opportunity.buyPrice) * opportunity.sellPrice - sizeUSD;
+            const netProfit = grossRevenue - tradeCosts.totalCosts;
+            
+            if (netProfit > maxProfit) {
+                maxProfit = netProfit;
+                optimalSize = sizeUSD;
             }
         }
         
-        return optimalAmount;
+        // Find minimum profitable size
+        let minProfitableSize = 100;
+        for (const sizeUSD of testSizes) {
+            const tradeCosts = await this.calculateTradingCosts(
+                opportunity,
+                sizeUSD / opportunity.buyPrice,
+                sizeUSD,
+                gasPrice,
+                0.005,
+                false,
+                true
+            );
+            
+            const grossRevenue = (sizeUSD / opportunity.buyPrice) * opportunity.sellPrice - sizeUSD;
+            const netProfit = grossRevenue - tradeCosts.totalCosts;
+            
+            if (netProfit > 0) {
+                minProfitableSize = sizeUSD;
+                break;
+            }
+        }
+        
+        return {
+            optimal: optimalSize,
+            maximum: optimalSize * 2, // Conservative max
+            minimum: minProfitableSize
+        };
     }
     
-    public async analyzeProfitability(
+    /**
+     * Calculate market risks and execution factors
+     */
+    private calculateMarketRisks(
         opportunity: ArbitrageOpportunity,
-        amount: string
-    ): Promise<ProfitAnalysis> {
+        tradeAmount: number,
+        currentSpread: number
+    ): {
+        priceImpact: number;
+        liquidityRisk: number;
+        executionWindow: number;
+        latencyRisk: number;
+    } {
+        
+        // Estimate price impact based on trade size
+        // Larger trades have more price impact
+        const priceImpact = Math.min(tradeAmount / 100000 * 0.01, 0.05); // Max 5% impact
+        
+        // Liquidity risk based on spread size
+        // Larger spreads often indicate lower liquidity
+        const liquidityRisk = Math.max(0.1, currentSpread / 10);
+        
+        // Execution window - how long arbitrage opportunity might last
+        // Higher spreads tend to close faster
+        const executionWindow = Math.max(30, 300 - (currentSpread * 20)); // 30-300 seconds
+        
+        // Latency risk - risk of opportunity disappearing due to delays
+        const latencyRisk = currentSpread > 2 ? 0.3 : 0.1; // Higher risk for large spreads
+        
+        return {
+            priceImpact,
+            liquidityRisk,
+            executionWindow,
+            latencyRisk
+        };
+    }
+    
+    /**
+     * Get current gas price from network
+     */
+    private async getCurrentGasPrice(): Promise<number> {
         try {
-            // Calculate base profit
-            const baseProfit = BigInt(opportunity.expectedProfit);
-            
-            // Calculate flash loan fee
-            const flashLoanFee = BigInt(this.flashLoanExecutor.calculateFlashLoanFee(amount));
-            
-            // Estimate gas cost
-            const optimalGasPrice = await this.estimateOptimalGasPrice();
-            const estimatedGas = await this.flashLoanExecutor.estimateFlashLoanGas({
-                token: opportunity.tokenIn,
-                amount,
-                targetDex: opportunity.toDex,
-                minProfitUSD: '0'
-            });
-            const estimatedGasCost = BigInt(optimalGasPrice) * BigInt(estimatedGas);
-            
-            // Calculate slippage impact
-            const slippageImpact = BigInt(await this.calculateSlippageImpact(opportunity, amount));
-            
-            // Calculate MEV protection cost
-            const mevProtectionCost = BigInt(this.calculateMEVProtection(amount));
-            
-            // Calculate net profit
-            const totalCosts = flashLoanFee + estimatedGasCost + slippageImpact + mevProtectionCost;
-            const netProfit = baseProfit > totalCosts ? baseProfit - totalCosts : BigInt(0);
-            
-            // Determine if the trade is viable
-            const isViable = netProfit > (BigInt(amount) * BigInt(Math.floor(this.MIN_PROFIT_THRESHOLD * 10000)) / BigInt(10000));
-            
-            // Find optimal trade size if viable
-            const profitableAmount = isViable
-                ? await this.findOptimalTradeSize(opportunity, amount)
-                : '0';
-            
-            // Calculate price impact
-            const priceImpact = ((slippageImpact * BigInt(10000)) / BigInt(amount)).toString();
-            
-            // Determine execution priority based on profit margin
-            const profitMargin = Number(netProfit) / Number(amount);
-            const executionPriority = Math.floor(profitMargin * 100);
-            
-            return {
-                baseProfit: baseProfit.toString(),
-                flashLoanFee: flashLoanFee.toString(),
-                estimatedGasCost: estimatedGasCost.toString(),
-                slippageImpact: slippageImpact.toString(),
-                mevProtectionCost: mevProtectionCost.toString(),
-                netProfit: netProfit.toString(),
-                netProfitUSD: (Number(netProfit) / 1e18).toString(), // Assuming 18 decimals
-                profitableAmount,
-                isViable,
-                details: {
-                    priceImpact,
-                    executionPriority,
-                    flashLoanAmount: amount,
-                    optimalGasPrice,
-                    minProfit: (BigInt(amount) * BigInt(Math.floor(this.MIN_PROFIT_THRESHOLD * 10000)) / BigInt(10000)).toString()
-                }
-            };
+            const gasPrice = await this.web3.eth.getGasPrice();
+            return parseFloat(Web3.utils.fromWei(gasPrice, 'gwei'));
         } catch (error) {
-            console.error('Error analyzing profitability:', error);
-            throw error;
+            console.warn('Failed to get current gas price, using default');
+            return 0.1; // Default 0.1 Gwei for Arbitrum
         }
+    }
+    
+    /**
+     * Quick profit check - simplified calculation for fast screening
+     */
+    public async quickProfitCheck(
+        opportunity: ArbitrageOpportunity,
+        tradeAmountUSD: number = 1000
+    ): Promise<{
+        isProfit: boolean;
+        netProfitUSD: number;
+        profitMarginPercent: number;
+        breakEvenSpread: number;
+    }> {
+        
+        // Quick cost estimation
+        const aaveFlashLoanFee = tradeAmountUSD * 0.001; // 0.1%
+        const estimatedGasCost = 5; // $5 estimated gas cost
+        const tradingFees = tradeAmountUSD * 0.006; // 0.6% total trading fees
+        const slippageCost = tradeAmountUSD * 0.01; // 1% slippage estimate
+        
+        const totalCosts = aaveFlashLoanFee + estimatedGasCost + tradingFees + slippageCost;
+        
+        // Calculate profit
+        const tradeAmount = tradeAmountUSD / opportunity.buyPrice;
+        const grossRevenue = (tradeAmount * opportunity.sellPrice) - tradeAmountUSD;
+        const netProfit = grossRevenue - totalCosts;
+        
+        const profitMargin = grossRevenue > 0 ? (netProfit / grossRevenue) * 100 : 0;
+        const breakEvenSpread = (totalCosts / tradeAmountUSD) * 100;
+        
+        return {
+            isProfit: netProfit > 0,
+            netProfitUSD: netProfit,
+            profitMarginPercent: profitMargin,
+            breakEvenSpread
+        };
+    }
+    
+    /**
+     * Format profit analysis for display
+     */
+    public formatProfitAnalysis(analysis: ProfitAnalysisDetailed): string {
+        return `
+💰 PROFIT ANALYSIS
+Revenue: $${analysis.grossRevenue.toFixed(2)}
+Costs: $${analysis.costs.totalCosts.toFixed(2)}
+Net Profit: $${analysis.netProfit.toFixed(2)} (${(analysis.profitMargin * 100).toFixed(2)}%)
+ROI: ${(analysis.roi * 100).toFixed(2)}%
+
+💸 COST BREAKDOWN
+Flash Loan Fee: $${(analysis.costs.aaveFlashLoanFee * 1000).toFixed(2)} (0.1%)
+Gas Costs: $${analysis.costs.totalGasCostUSD.toFixed(2)} (${analysis.costs.totalGasUsed.toLocaleString()} gas)
+Trading Fees: $${(analysis.costs.buyDexFeeAmount + analysis.costs.sellDexFeeAmount).toFixed(2)}
+Slippage: $${analysis.costs.totalSlippageCost.toFixed(2)}
+
+📊 RISK METRICS
+Break-even Spread: ${analysis.breakEvenSpread.toFixed(2)}%
+Safety Margin: ${analysis.safetyMargin.toFixed(2)}%
+Price Impact: ${(analysis.priceImpact * 100).toFixed(2)}%
+Execution Window: ${analysis.executionWindow}s
+
+💡 TRADE SIZING
+Optimal Size: $${analysis.optimalTradeSize.toLocaleString()}
+Min Profitable: $${analysis.minProfitableSize.toLocaleString()}
+Max Recommended: $${analysis.maxTradeSize.toLocaleString()}
+        `.trim();
     }
 }
